@@ -43,9 +43,9 @@ KRAKEN_REST_BASE = "https://api.kraken.com"
 DEFAULT_PRODUCTS = [
     "DOGE/USD",
     "PEPE/USD",
-    "SHIB/USD",
-    "BONK/USD",
-    "WIF/USD",
+    "SOL/USD",
+    "SUI/USD",
+    "FARTCOIN/USD",
 ]
 
 # Map from Kraken WS symbol → internal product ID (Coinbase-style)
@@ -53,20 +53,26 @@ DEFAULT_PRODUCTS = [
 KRAKEN_TO_INTERNAL = {
     "DOGE/USD": "DOGE-USD",
     "PEPE/USD": "PEPE-USD",
+    "SOL/USD": "SOL-USD",
+    "SUI/USD": "SUI-USD",
+    "FARTCOIN/USD": "FARTCOIN-USD",
+    # Legacy / alternate coins
     "SHIB/USD": "SHIB-USD",
     "BONK/USD": "BONK-USD",
     "WIF/USD": "WIF-USD",
-    "SOL/USD": "SOL-USD",
     "FLOKI/USD": "FLOKI-USD",
 }
 
 INTERNAL_TO_KRAKEN_REST = {
     "DOGE-USD": "XDGUSD",
     "PEPE-USD": "PEPEUSD",
+    "SOL-USD": "SOLUSD",
+    "SUI-USD": "SUIUSD",
+    "FARTCOIN-USD": "FARTCOINUSD",
+    # Legacy / alternate coins
     "SHIB-USD": "SHIBUSD",
     "BONK-USD": "BONKUSD",
     "WIF-USD": "WIFUSD",
-    "SOL-USD": "SOLUSD",
     "FLOKI-USD": "FLOKIUSD",
 }
 

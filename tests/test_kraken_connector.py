@@ -36,7 +36,9 @@ class TestSymbolMapping:
     def test_kraken_rest_format(self):
         assert INTERNAL_TO_KRAKEN_REST["DOGE-USD"] == "XDGUSD"
         assert INTERNAL_TO_KRAKEN_REST["PEPE-USD"] == "PEPEUSD"
-        assert INTERNAL_TO_KRAKEN_REST["SHIB-USD"] == "SHIBUSD"
+        assert INTERNAL_TO_KRAKEN_REST["SOL-USD"] == "SOLUSD"
+        assert INTERNAL_TO_KRAKEN_REST["SUI-USD"] == "SUIUSD"
+        assert INTERNAL_TO_KRAKEN_REST["FARTCOIN-USD"] == "FARTCOINUSD"
 
 
 # ── Ticker handling ─────────────────────────────────────────────

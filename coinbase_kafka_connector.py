@@ -42,9 +42,9 @@ COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 DEFAULT_PRODUCTS = [
     "DOGE-USD",
     "PEPE-USD",
-    "SHIB-USD",
-    "BNKR-USD",
-    "WIF-USD",
+    "SOL-USD",
+    "SUI-USD",
+    "FARTCOIN-USD",
 ]
 
 RECONNECT_DELAY_SECONDS = 3
