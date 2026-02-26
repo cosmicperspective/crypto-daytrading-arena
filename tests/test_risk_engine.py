@@ -210,6 +210,147 @@ class TestCooldown:
         assert not on_cd
 
 
+def _make_short_plan(
+    agent_id: str = "test-agent",
+    product_id: str = "DOGE-USD",
+    entry_price: float = 0.10,
+    stop_loss: float = 0.11,
+    take_profit: float = 0.08,
+    time_stop: int = 30,
+    quantity: float = 1000.0,
+) -> TradingPlan:
+    return TradingPlan(
+        plan_id=new_plan_id(),
+        agent_id=agent_id,
+        product_id=product_id,
+        direction="short",
+        quantity=quantity,
+        entry_price=entry_price,
+        stop_loss_price=stop_loss,
+        take_profit_price=take_profit,
+        time_stop_minutes=time_stop,
+        thesis="short test thesis",
+        confidence=0.7,
+    )
+
+
+class TestShortStopLoss:
+    def test_short_stop_loss_triggered_when_price_rises(self):
+        """Short SL at 0.11, price at 0.115 → should trigger."""
+        pb = _make_price_book(**{"DOGE-USD": "0.115"})
+        sell_calls = []
+        engine = RiskEngine(pb, lambda *a: sell_calls.append(a) or "sold")
+        plan = _make_short_plan(stop_loss=0.11)
+        engine.register_plan(plan)
+        triggered = engine.check_plans()
+        assert len(triggered) == 1
+        assert triggered[0].status == PlanStatus.STOPPED_OUT
+        assert triggered[0].pnl < 0  # loss on short when price rises
+        # Exit action should be "buy" (cover short)
+        assert sell_calls[0][3] == "buy"
+
+    def test_short_stop_loss_not_triggered_below(self):
+        """Short SL at 0.11, price at 0.095 → should NOT trigger."""
+        pb = _make_price_book(**{"DOGE-USD": "0.095"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan(stop_loss=0.11)
+        engine.register_plan(plan)
+        assert len(engine.check_plans()) == 0
+
+
+class TestShortTakeProfit:
+    def test_short_take_profit_triggered_when_price_drops(self):
+        """Short TP at 0.08, price at 0.075 → should trigger."""
+        pb = _make_price_book(**{"DOGE-USD": "0.075"})
+        sell_calls = []
+        engine = RiskEngine(pb, lambda *a: sell_calls.append(a) or "sold")
+        plan = _make_short_plan(take_profit=0.08)
+        engine.register_plan(plan)
+        triggered = engine.check_plans()
+        assert len(triggered) == 1
+        assert triggered[0].status == PlanStatus.TAKE_PROFIT
+        assert triggered[0].pnl > 0  # profit on short when price drops
+        assert sell_calls[0][3] == "buy"
+
+    def test_short_take_profit_not_triggered_above(self):
+        """Short TP at 0.08, price at 0.095 → should NOT trigger."""
+        pb = _make_price_book(**{"DOGE-USD": "0.095"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan(take_profit=0.08)
+        engine.register_plan(plan)
+        assert len(engine.check_plans()) == 0
+
+
+class TestShortPnl:
+    def test_short_pnl_calculation(self):
+        """Short at 0.10, exit at 0.08 → pnl = (0.10 - 0.08) * 1000 = +20."""
+        pb = _make_price_book(**{"DOGE-USD": "0.075"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan(entry_price=0.10, take_profit=0.08, quantity=1000)
+        engine.register_plan(plan)
+        triggered = engine.check_plans()
+        # Exit price is best_ask (same as price in test helper)
+        assert triggered[0].pnl == pytest.approx((0.10 - 0.075) * 1000)
+
+    def test_short_loss_pnl(self):
+        """Short at 0.10, exit at 0.115 → pnl = (0.10 - 0.115) * 1000 = -15."""
+        pb = _make_price_book(**{"DOGE-USD": "0.115"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan(entry_price=0.10, stop_loss=0.11, quantity=1000)
+        engine.register_plan(plan)
+        triggered = engine.check_plans()
+        assert triggered[0].pnl == pytest.approx((0.10 - 0.115) * 1000)
+
+
+class TestShortModifyPlan:
+    def test_tighten_short_stop_lower(self):
+        """Short stop at 0.11, tighten to 0.105 → should work."""
+        pb = _make_price_book(**{"DOGE-USD": "0.10"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan(stop_loss=0.11)
+        engine.register_plan(plan)
+        ok, msg = engine.modify_plan(plan.plan_id, new_stop_loss=0.105)
+        assert ok
+        assert plan.stop_loss_price == 0.105
+
+    def test_cannot_widen_short_stop(self):
+        """Short stop at 0.11, try to widen to 0.12 → should fail."""
+        pb = _make_price_book(**{"DOGE-USD": "0.10"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan(stop_loss=0.11)
+        engine.register_plan(plan)
+        ok, msg = engine.modify_plan(plan.plan_id, new_stop_loss=0.12)
+        assert not ok
+        assert "lower" in msg.lower()
+
+
+class TestShortClosePlan:
+    def test_close_short_plan(self):
+        pb = _make_price_book(**{"DOGE-USD": "0.095"})
+        sell_calls = []
+        engine = RiskEngine(pb, lambda *a: sell_calls.append(a) or "sold")
+        plan = _make_short_plan()
+        engine.register_plan(plan)
+        ok, msg = engine.close_plan(plan.plan_id)
+        assert ok
+        assert len(engine.get_active_plans()) == 0
+        # Close a short = buy to cover
+        assert sell_calls[0][3] == "buy"
+        completed = engine.get_completed_plans()
+        assert completed[0].pnl == pytest.approx((0.10 - 0.095) * 1000)
+
+
+class TestShortUnrealizedPnl:
+    def test_short_unrealized_pnl_in_state_text(self):
+        pb = _make_price_book(**{"DOGE-USD": "0.095"})
+        engine = RiskEngine(pb, lambda *a: "sold")
+        plan = _make_short_plan()
+        engine.register_plan(plan)
+        text = engine.get_agent_state_text("test-agent")
+        assert "SHORT" in text
+        assert "$+5.0000" in text  # (0.10 - 0.095) * 1000 = 5.0
+
+
 class TestAgentStateText:
     def test_no_plans(self):
         engine = RiskEngine(_make_price_book(**{"DOGE-USD": "0.10"}), lambda *a: "sold")

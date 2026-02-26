@@ -9,30 +9,70 @@ Usage:
 
 import asyncio
 import json
+import logging
+import os
 import sqlite3
 import time
 from pathlib import Path
 
+import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
 
+load_dotenv()
+
 DB_PATH = Path(__file__).parent / "arena.db"
 INITIAL_CASH = 200.0
-
-# Gemini 2.5 Flash pricing per 1M tokens
-PRICE_INPUT = 0.15 / 1_000_000
-PRICE_OUTPUT = 0.60 / 1_000_000
-PRICE_THINKING = 0.70 / 1_000_000
-# Estimated tokens per LLM call
-EST_INPUT_TOKENS = 1500
-EST_OUTPUT_TOKENS = 300
-EST_THINKING_TOKENS = 500
-# Estimated LLM calls per trade (reasoning + tool calls + follow-up)
-LLM_CALLS_PER_TRADE = 3.5
-# Estimated LLM calls for non-trade ticks (agent reasons but holds)
-# ~60% of ticks result in no trade, each still costs 2 LLM calls
 START_TIME = time.time()
+
+logger = logging.getLogger(__name__)
+
+# ── Live OpenRouter cost tracking ────────────────────────────────
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+_or_spend_cache: dict = {"total": 0.0, "last_poll": 0.0, "limit": 0.0, "remaining": 0.0}
+_or_model_prices: dict = {}  # model_id -> {input: $/token, output: $/token}
+_OR_POLL_INTERVAL = 10.0  # seconds between API polls
+
+
+def _poll_openrouter_spend() -> dict:
+    """Poll OpenRouter /auth/key for real cumulative spend."""
+    now = time.time()
+    if now - _or_spend_cache["last_poll"] < _OR_POLL_INTERVAL:
+        return _or_spend_cache
+    if not OPENROUTER_API_KEY:
+        return _or_spend_cache
+    try:
+        r = httpx.get(
+            "https://openrouter.ai/api/v1/auth/key",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            timeout=5,
+        )
+        data = r.json().get("data", {})
+        _or_spend_cache["total"] = float(data.get("usage", 0))
+        _or_spend_cache["limit"] = float(data.get("limit", 0))
+        _or_spend_cache["remaining"] = float(data.get("limit_remaining", 0))
+        _or_spend_cache["last_poll"] = now
+    except Exception as e:
+        logger.debug("OpenRouter poll failed: %s", e)
+    return _or_spend_cache
+
+
+def _load_model_prices() -> None:
+    """Fetch live per-model pricing from OpenRouter at startup."""
+    if _or_model_prices or not OPENROUTER_API_KEY:
+        return
+    try:
+        r = httpx.get("https://openrouter.ai/api/v1/models", timeout=15)
+        for m in r.json().get("data", []):
+            p = m.get("pricing", {})
+            _or_model_prices[m["id"]] = {
+                "input": float(p.get("prompt", 0)),
+                "output": float(p.get("completion", 0)),
+            }
+    except Exception as e:
+        logger.debug("OpenRouter models fetch failed: %s", e)
 
 app = FastAPI()
 
@@ -180,26 +220,15 @@ def query_db() -> dict:
             last = last + (row["qty"] * row["price"]) - row["fee"]
         balance_series[aid].append(round(last, 2))
 
-    # LLM spend estimation — based on actual trade count
-    # Each agent invocation (tick) does ~3 LLM calls (reason + tool + follow-up)
-    # We estimate total ticks from trade log: count distinct (ts, agent_id) groups
+    # Live LLM spend from OpenRouter API
     total_trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
     num_agents = max(len(agents), 1)
     elapsed_min = (time.time() - START_TIME) / 60
 
-    # Count actual agent invocations from distinct trade timestamps
-    # Each trade represents ~1 invocation, but many invocations produce no trade
-    # Estimate: ~1 trade per 4 invocations (25% trade rate)
-    est_invocations = max(total_trades * 4, num_agents)  # at least 1 per agent
-    LLM_CALLS_PER_INVOCATION = 3  # reason about market + get_portfolio + decide
-    est_total_calls = est_invocations * LLM_CALLS_PER_INVOCATION
-    cost_per_call = (
-        EST_INPUT_TOKENS * PRICE_INPUT +
-        EST_OUTPUT_TOKENS * PRICE_OUTPUT +
-        EST_THINKING_TOKENS * PRICE_THINKING
-    )
-    est_spend = est_total_calls * cost_per_call
-    est_spend_per_hour = (est_spend / max(elapsed_min, 0.1)) * 60
+    or_data = _poll_openrouter_spend()
+    real_spend = or_data["total"]
+    spend_per_hour = (real_spend / max(elapsed_min, 0.1)) * 60 if real_spend > 0 else 0.0
+    credit_remaining = or_data["remaining"]
 
     # Detect competition mode from agent data
     strategies = set(a["strategy"] for a in agents.values())
@@ -227,12 +256,17 @@ def query_db() -> dict:
         "mode": mode,
         "mode_label": mode_label,
         "llm_spend": {
-            "total_est": round(est_spend, 4),
-            "per_hour_est": round(est_spend_per_hour, 4),
+            "total": round(real_spend, 4),
+            "per_hour": round(spend_per_hour, 4),
+            "credit_remaining": round(credit_remaining, 2),
             "total_trades": total_trades,
-            "est_llm_calls": int(est_total_calls),
             "elapsed_min": round(elapsed_min, 1),
             "model": "multiple" if len(models_set) > 1 else next(iter(models_set), "unknown"),
+            "model_prices": {
+                mid: _or_model_prices.get(mid, {})
+                for mid in models_set
+                if mid in _or_model_prices
+            },
         },
     }
 
@@ -644,12 +678,12 @@ HTML = """<!DOCTYPE html>
   <div class="spend-ticker" id="spend-ticker">
     <div>
       <div class="spend-amount" id="spend-total">$0.0000</div>
-      <div class="spend-detail">LLM Spend (est.)</div>
+      <div class="spend-detail">LLM Spend (live)</div>
     </div>
     <div class="spend-detail">
       <div><span class="spend-rate" id="spend-rate">$0.00/hr</span></div>
-      <div><span id="spend-calls">0</span> LLM calls</div>
-      <div><span id="spend-model">gemini-2.5-flash</span></div>
+      <div>Credit: $<span id="spend-remaining">0</span></div>
+      <div><span id="spend-model">openrouter</span></div>
     </div>
   </div>
   <div class="live-badge">
@@ -799,8 +833,8 @@ const STRATEGY_GUIDE = {
 };
 
 const LLM_GUIDE = {
-  'google/gemini-2.5-flash': {color:'#60a5fa', title:'Gemini 2.5 Flash', provider:'Google', desc:'Fast multimodal model with strong reasoning. $0.15/$0.60 per 1M tokens.'},
-  'openai/gpt-5-nano': {color:'#34d399', title:'GPT-5 Nano', provider:'OpenAI', desc:'Smallest GPT-5 variant. Low reasoning mode. Ultra-cheap at $0.05/$0.40 per 1M tokens.'},
+  'google/gemini-2.5-flash': {color:'#60a5fa', title:'Gemini 2.5 Flash', provider:'Google', desc:'Fast multimodal model with strong reasoning. $0.30/$2.50 per 1M tokens.'},
+  'openai/gpt-5-nano': {color:'#34d399', title:'GPT-5 Nano', provider:'OpenAI', desc:'Smallest GPT-5 variant. Low reasoning mode. $0.05/$0.40 per 1M tokens.'},
   'minimax/minimax-m2.5': {color:'#f472b6', title:'MiniMax M2.5', provider:'MiniMax', desc:'Competitive Chinese frontier model. $0.30/$1.10 per 1M tokens.'},
   'x-ai/grok-4.1-fast': {color:'#fbbf24', title:'Grok 4.1 Fast', provider:'xAI', desc:'Speed-optimized Grok. No reasoning mode. $0.20/$0.50 per 1M tokens.'},
   'anthropic/claude-haiku-4.5': {color:'#a78bfa', title:'Claude Haiku 4.5', provider:'Anthropic', desc:'Fastest Claude model. Matches Sonnet 4 reasoning. $1.00/$5.00 per 1M tokens.'},
@@ -1060,19 +1094,13 @@ function render(data) {
     }).join('');
   }
 
-  // LLM Spend ticker
+  // LLM Spend ticker (live from OpenRouter)
   if (data.llm_spend) {
     const s = data.llm_spend;
-    document.getElementById('spend-total').textContent = '$' + s.total_est.toFixed(4);
-    document.getElementById('spend-rate').textContent = '$' + s.per_hour_est.toFixed(2) + '/hr';
-    document.getElementById('spend-calls').textContent = s.est_llm_calls.toLocaleString();
-    document.getElementById('spend-model').textContent = s.model + ' (direct)';
-    // Update LLM rate chip
-    const rateEl = document.getElementById('sys-llm-rate');
-    if (rateEl && s.elapsed_min > 0.1) {
-      const callsPerSec = (s.est_llm_calls / (s.elapsed_min * 60)).toFixed(1);
-      rateEl.textContent = '~' + callsPerSec + '/s';
-    }
+    document.getElementById('spend-total').textContent = '$' + s.total.toFixed(4);
+    document.getElementById('spend-rate').textContent = '$' + s.per_hour.toFixed(2) + '/hr';
+    document.getElementById('spend-remaining').textContent = s.credit_remaining.toFixed(2);
+    document.getElementById('spend-model').textContent = s.model + ' via OpenRouter';
   }
 
   // Chart
@@ -1127,4 +1155,5 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 if __name__ == "__main__":
+    _load_model_prices()
     uvicorn.run(app, host="0.0.0.0", port=8050)

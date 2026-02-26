@@ -32,7 +32,7 @@ class TradingPlan:
     plan_id: str
     agent_id: str
     product_id: str
-    direction: str          # "long"  (short not yet supported)
+    direction: str          # "long" or "short"
     quantity: float
     entry_price: float
     stop_loss_price: float
@@ -109,8 +109,13 @@ class RiskEngine:
             if plan.direction == "long" and new_stop_loss > plan.stop_loss_price:
                 plan.stop_loss_price = new_stop_loss
                 msgs.append(f"Stop tightened to ${new_stop_loss:.6f}")
+            elif plan.direction == "short" and new_stop_loss < plan.stop_loss_price:
+                plan.stop_loss_price = new_stop_loss
+                msgs.append(f"Stop tightened to ${new_stop_loss:.6f}")
             elif plan.direction == "long":
                 return False, "Can only tighten stops (move stop higher for longs)."
+            else:
+                return False, "Can only tighten stops (move stop lower for shorts)."
         if new_take_profit is not None:
             plan.take_profit_price = new_take_profit
             msgs.append(f"TP moved to ${new_take_profit:.6f}")
@@ -121,14 +126,21 @@ class RiskEngine:
         if not plan or plan.status != PlanStatus.ACTIVE:
             return False, f"Plan {plan_id} not found or not active."
         entry = self._price_book.get(plan.product_id)
-        exit_price = float(entry["best_bid"]) if entry else plan.entry_price
+        if plan.direction == "long":
+            exit_price = float(entry["best_bid"]) if entry else plan.entry_price
+        else:
+            exit_price = float(entry["best_ask"]) if entry else plan.entry_price
         plan.status = PlanStatus.CLOSED
         plan.closed_at = time.time()
         plan.exit_price = exit_price
         plan.exit_reason = reason
-        plan.pnl = (exit_price - plan.entry_price) * plan.quantity if plan.direction == "long" else 0
-        # Execute the sell
-        msg = self._execute_sell(plan.agent_id, plan.product_id, plan.quantity, "sell")
+        if plan.direction == "long":
+            plan.pnl = (exit_price - plan.entry_price) * plan.quantity
+        else:
+            plan.pnl = (plan.entry_price - exit_price) * plan.quantity
+        # Execute exit trade: sell to close long, buy to cover short
+        exit_action = "sell" if plan.direction == "long" else "buy"
+        msg = self._execute_sell(plan.agent_id, plan.product_id, plan.quantity, exit_action)
         self._completed.append(plan)
         del self._plans[plan.plan_id]
         self._track_loss(plan)
@@ -158,25 +170,37 @@ class RiskEngine:
             if plan.time_stop_minutes > 0 and elapsed_min >= plan.time_stop_minutes:
                 exit_reason = "time_stop"
                 plan.status = PlanStatus.TIME_STOPPED
-            # Stop-loss
+            # Stop-loss / Take-profit — direction-aware
             elif plan.direction == "long" and current <= plan.stop_loss_price:
                 exit_reason = "stop_loss"
                 plan.status = PlanStatus.STOPPED_OUT
-            # Take-profit
             elif plan.direction == "long" and current >= plan.take_profit_price:
+                exit_reason = "take_profit"
+                plan.status = PlanStatus.TAKE_PROFIT
+            elif plan.direction == "short" and current >= plan.stop_loss_price:
+                exit_reason = "stop_loss"
+                plan.status = PlanStatus.STOPPED_OUT
+            elif plan.direction == "short" and current <= plan.take_profit_price:
                 exit_reason = "take_profit"
                 plan.status = PlanStatus.TAKE_PROFIT
 
             if exit_reason:
-                exit_price = float(entry["best_bid"]) if plan.direction == "long" else float(entry["best_ask"])
+                if plan.direction == "long":
+                    exit_price = float(entry["best_bid"])
+                else:
+                    exit_price = float(entry["best_ask"])
                 plan.closed_at = now
                 plan.exit_price = exit_price
                 plan.exit_reason = exit_reason
-                plan.pnl = (exit_price - plan.entry_price) * plan.quantity if plan.direction == "long" else 0
+                if plan.direction == "long":
+                    plan.pnl = (exit_price - plan.entry_price) * plan.quantity
+                else:
+                    plan.pnl = (plan.entry_price - exit_price) * plan.quantity
 
-                # Execute exit trade
+                # Execute exit trade: sell to close long, buy to cover short
+                exit_action = "sell" if plan.direction == "long" else "buy"
                 try:
-                    self._execute_sell(plan.agent_id, plan.product_id, plan.quantity, "sell")
+                    self._execute_sell(plan.agent_id, plan.product_id, plan.quantity, exit_action)
                 except Exception:
                     logger.exception("Failed to execute exit for plan %s", plan_id)
 
@@ -222,7 +246,10 @@ class RiskEngine:
                 elapsed = (time.time() - p.created_at) / 60
                 entry = self._price_book.get(p.product_id)
                 cur = float(entry["price"]) if entry else p.entry_price
-                unreal = (cur - p.entry_price) * p.quantity if p.direction == "long" else 0
+                if p.direction == "long":
+                    unreal = (cur - p.entry_price) * p.quantity
+                else:
+                    unreal = (p.entry_price - cur) * p.quantity
                 lines.append(
                     f"  [{p.plan_id}] {p.direction.upper()} {p.product_id} "
                     f"qty={p.quantity:.4f} entry=${p.entry_price:.6f} "

@@ -92,7 +92,13 @@ class AgentAccount:
     memory_calls: int = 0  # times agent called get_trade_history or get_performance_stats
 
     def portfolio_value(self, price_book: PriceBook) -> float:
-        """Total value: cash + mark-to-market of all positions using live prices."""
+        """Total value: cash + mark-to-market of all positions using live prices.
+
+        Long positions (qty > 0): valued at current market price.
+        Short positions (qty < 0): collateral already in cash; unrealized P&L =
+        (entry - current) * |qty|, added via the signed qty math (qty is negative,
+        so qty * price is negative, offsetting the cash collateral).
+        """
         positions_value = 0.0
         for pid, qty in self.positions.items():
             entry = price_book.get(pid)
@@ -101,11 +107,11 @@ class AgentAccount:
         return self.cash + positions_value
 
     def avg_cost_per_unit(self, product_id: str) -> float:
-        """Average cost per unit for a position."""
+        """Average cost per unit for a position (long or short)."""
         qty = self.positions.get(product_id, 0)
         if qty == 0:
             return 0.0
-        return self.cost_basis.get(product_id, 0.0) / qty
+        return self.cost_basis.get(product_id, 0.0) / abs(qty)
 
 
 # ── Account store ────────────────────────────────────────────────
@@ -269,6 +275,56 @@ class AccountStore:
             price = base_price * (1 + total_bps / 10_000)
             cost = price * quantity
             fee = cost * (fee_bps / 10_000)
+
+            existing_qty = account.positions.get(product_id, 0)
+
+            # ── Covering a short position (existing_qty < 0) ──
+            if existing_qty < 0:
+                short_qty = abs(existing_qty)
+                cover_qty = min(quantity, short_qty)
+                if cost + fee > account.cash:
+                    return TradeResult(
+                        False,
+                        f"Insufficient cash to cover short. Need ${cost + fee:,.2f} "
+                        f"but only have ${account.cash:,.2f}.",
+                    )
+                if quantity > short_qty:
+                    return TradeResult(
+                        False,
+                        f"Can only cover {short_qty} {product_id} (your short size). "
+                        f"Close short first before opening a long.",
+                    )
+                account.cash -= (cost + fee)
+                # Realized PnL for short: (entry - exit) * qty
+                avg_cost = account.avg_cost_per_unit(product_id)  # negative qty → negative cost_basis / qty → positive per-unit
+                realized = (avg_cost - price) * cover_qty - fee
+                account.realized_pnl += realized
+                account.fees_paid += fee
+                if realized >= 0:
+                    account.wins += 1
+                else:
+                    account.losses += 1
+                # Reduce cost basis proportionally
+                account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) - (
+                    abs(avg_cost) * cover_qty
+                )
+                new_qty = round(existing_qty + cover_qty, 1)  # moves toward 0
+                if new_qty >= 0:
+                    del account.positions[product_id]
+                    del account.cost_basis[product_id]
+                    account.avg_entry_ts.pop(product_id, None)
+                else:
+                    account.positions[product_id] = new_qty
+                account.trade_count += 1
+                account.last_trade_ts = now_ts
+                self._record_trade(agent_id, action, product_id, cover_qty, price, fee, latency)
+                return TradeResult(
+                    True,
+                    f"Covered {cover_qty} {product_id} short @ ${price:,.2f} for ${cost:,.2f}. "
+                    f"P&L: ${realized:+,.2f}. Fee: ${fee:,.2f}. Cash remaining: ${account.cash:,.2f}.",
+                )
+
+            # ── Opening / adding to a long position ──
             if cost + fee > account.cash:
                 if not self._sim.allow_negative_cash:
                     return TradeResult(
@@ -285,7 +341,6 @@ class AccountStore:
             if self._sim.max_order_usd is not None and cost > self._sim.max_order_usd:
                 return TradeResult(False, f"Order exceeds max_order_usd (${self._sim.max_order_usd:,.0f}).")
 
-            existing_qty = account.positions.get(product_id, 0)
             new_position_value = (existing_qty + quantity) * price
             if self._sim.max_position_usd is not None and new_position_value > self._sim.max_position_usd:
                 return TradeResult(
@@ -294,11 +349,11 @@ class AccountStore:
                 )
 
             account.cash -= (cost + fee)
-            existing_qty = account.positions.get(product_id, 0)
             existing_ts = account.avg_entry_ts.get(product_id, now_ts)
-            account.avg_entry_ts[product_id] = (existing_qty * existing_ts + quantity * now_ts) / (
-                existing_qty + quantity
-            )
+            if existing_qty + quantity > 0:
+                account.avg_entry_ts[product_id] = (existing_qty * existing_ts + quantity * now_ts) / (
+                    existing_qty + quantity
+                )
             account.positions[product_id] = existing_qty + quantity
             account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) + cost + fee
             account.trade_count += 1
@@ -311,48 +366,92 @@ class AccountStore:
                 f"Fee: ${fee:,.2f}. Cash remaining: ${account.cash:,.2f}.",
             )
 
-        # sell
+        # sell — close long, or open/add-to short
         base_price = best_bid
         if order_type == "limit":
             base_price = max(best_bid, float(limit_price))
         price = base_price * (1 - total_bps / 10_000)
-        held = account.positions.get(product_id, 0)
-        if quantity > held:
-            return TradeResult(
-                False,
-                f"Insufficient holdings. Want to sell {quantity} {product_id} "
-                f"but only hold {held}.",
-            )
+        held = account.positions.get(product_id, 0)  # positive = long, negative = short
         proceeds = price * quantity
         fee = proceeds * (fee_bps / 10_000)
         if self._sim.max_order_usd is not None and proceeds > self._sim.max_order_usd:
             return TradeResult(False, f"Order exceeds max_order_usd (${self._sim.max_order_usd:,.0f}).")
+
+        if held > 0 and quantity <= held:
+            # ── Closing (or reducing) a long position ──
+            account.cash += proceeds - fee
+            avg_cost = account.avg_cost_per_unit(product_id)
+            account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) - (
+                avg_cost * quantity
+            )
+            realized = (price - avg_cost) * quantity - fee
+            account.realized_pnl += realized
+            account.fees_paid += fee
+            if realized >= 0:
+                account.wins += 1
+            else:
+                account.losses += 1
+            new_qty = round(held - quantity, 1)
+            if new_qty <= 0:
+                del account.positions[product_id]
+                del account.cost_basis[product_id]
+                account.avg_entry_ts.pop(product_id, None)
+            else:
+                account.positions[product_id] = new_qty
+            account.trade_count += 1
+            account.last_trade_ts = now_ts
+            self._record_trade(agent_id, action, product_id, quantity, price, fee, latency)
+            return TradeResult(
+                True,
+                f"Sold {quantity} {product_id} @ ${price:,.2f} for ${proceeds:,.2f}. "
+                f"Fee: ${fee:,.2f}. Cash remaining: ${account.cash:,.2f}.",
+            )
+
+        if held > 0 and quantity > held:
+            # Can't sell more than you hold as a long AND open a short in one order
+            return TradeResult(
+                False,
+                f"Insufficient holdings. Want to sell {quantity} {product_id} "
+                f"but only hold {held}. Close your long first before opening a short.",
+            )
+
+        # ── Opening / adding to a short position (held <= 0) ──
+        # Cash collateral: hold quantity * price as margin reserve
+        collateral = proceeds
+        if collateral + fee > account.cash:
+            return TradeResult(
+                False,
+                f"Insufficient cash for short collateral. Need ${collateral + fee:,.2f} "
+                f"but only have ${account.cash:,.2f}.",
+            )
+        if self._sim.max_position_usd is not None:
+            new_short_value = (abs(held) + quantity) * price
+            if new_short_value > self._sim.max_position_usd:
+                return TradeResult(
+                    False,
+                    f"Short position exceeds max_position_usd (${self._sim.max_position_usd:,.0f}).",
+                )
+
+        # Cash goes UP by proceeds (we sold), but we also lock collateral.
+        # Net effect on cash: proceeds - fee (proceeds received) but the position
+        # will be valued at -qty * current_price in portfolio_value, which offsets.
         account.cash += proceeds - fee
-        # Reduce cost basis proportionally (average cost method)
-        avg_cost = account.avg_cost_per_unit(product_id)
-        account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) - (
-            avg_cost * quantity
+        existing_short_qty = abs(held)  # held is <= 0
+        existing_ts = account.avg_entry_ts.get(product_id, now_ts)
+        total_qty = existing_short_qty + quantity
+        account.avg_entry_ts[product_id] = (
+            (existing_short_qty * existing_ts + quantity * now_ts) / total_qty
         )
-        realized = (price - avg_cost) * quantity - fee
-        account.realized_pnl += realized
-        account.fees_paid += fee
-        if realized >= 0:
-            account.wins += 1
-        else:
-            account.losses += 1
-        new_qty = round(held - quantity, 1)
-        if new_qty <= 0:
-            del account.positions[product_id]
-            del account.cost_basis[product_id]
-            account.avg_entry_ts.pop(product_id, None)
-        else:
-            account.positions[product_id] = new_qty
+        account.positions[product_id] = held - quantity  # goes more negative
+        # Cost basis tracks total notional sold (for avg cost calc)
+        account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) + proceeds + fee
         account.trade_count += 1
+        account.fees_paid += fee
         account.last_trade_ts = now_ts
         self._record_trade(agent_id, action, product_id, quantity, price, fee, latency)
         return TradeResult(
             True,
-            f"Sold {quantity} {product_id} @ ${price:,.2f} for ${proceeds:,.2f}. "
+            f"Short sold {quantity} {product_id} @ ${price:,.2f} (${proceeds:,.2f}). "
             f"Fee: ${fee:,.2f}. Cash remaining: ${account.cash:,.2f}.",
         )
 
@@ -797,12 +896,14 @@ def _get_portfolio(agent_id: str) -> str:
         lines.append("Positions: none")
     else:
         lines.append(
-            "| Ticker | Qty | Avg Cost | Total Cost "
+            "| Ticker | Side | Qty | Avg Entry | Total Cost "
             "| Current Price | Mkt Value | P&L | Avg Time Held |"
         )
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for pid in sorted(account.positions):
             qty = account.positions[pid]
+            side = "SHORT" if qty < 0 else "LONG"
+            display_qty = abs(qty)
             avg_cost = account.avg_cost_per_unit(pid)
             total_cost = account.cost_basis.get(pid, 0.0)
             hold_str = _format_hold_time(account.avg_entry_ts.get(pid))
@@ -810,17 +911,22 @@ def _get_portfolio(agent_id: str) -> str:
             entry = pb.get(pid)
             if entry is not None:
                 current_price = float(entry["price"])
-                mkt_value = current_price * qty
-                pnl = mkt_value - total_cost
+                if qty > 0:
+                    mkt_value = current_price * qty
+                    pnl = mkt_value - total_cost
+                else:
+                    # Short: profit = (entry - current) * |qty|
+                    mkt_value = current_price * abs(qty)
+                    pnl = (avg_cost - current_price) * abs(qty) - (total_cost - avg_cost * abs(qty))
                 pnl_sign = "+" if pnl >= 0 else ""
                 lines.append(
-                    f"| {pid} | {qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
+                    f"| {pid} | {side} | {display_qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
                     f"| ${current_price:,.2f} | ${mkt_value:,.2f} "
                     f"| {pnl_sign}${pnl:,.2f} | {hold_str} |"
                 )
             else:
                 lines.append(
-                    f"| {pid} | {qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
+                    f"| {pid} | {side} | {display_qty:g} | ${avg_cost:,.2f} | ${total_cost:,.2f} "
                     f"| N/A | N/A | N/A | {hold_str} |"
                 )
 
@@ -848,8 +954,12 @@ def execute_trade(
     Fractional share trading is allowed, up to 4 decimal places (e.g., 0.5, 0.0015).
     Your starting cash is $100. Size positions accordingly — check your portfolio first!
 
+    Selling when you have no position opens a SHORT — you profit if price drops.
+    Buying when you have a short position COVERS (closes) the short.
+    Cash collateral is held for shorts. No leverage or margin.
+
     Args:
-        product_id: Trading pair (e.g., DOGE-USD, PEPE-USD, SHIB-USD, BNKR-USD, WIF-USD)
+        product_id: Trading pair (e.g., DOGE-USD, PEPE-USD, SOL-USD, SUI-USD, FARTCOIN-USD)
         quantity: Number of units to trade (positive, up to 4 decimal places)
         action: 'buy' or 'sell'
         order_type: 'market' or 'limit' (default: market)
@@ -1107,15 +1217,17 @@ def create_trading_plan(
     - Price hits your take-profit (profit secured)
     - Time expires (forced exit after time_stop_minutes)
 
-    You do NOT need to manually sell — the risk engine handles exits.
+    You do NOT need to manually sell/cover — the risk engine handles exits.
     Use modify_plan to tighten stops or adjust targets while the trade is active.
 
     Args:
         product_id: Trading pair (e.g., DOGE-USD)
-        direction: 'long' (buy low, sell high)
-        quantity: Number of units to buy
-        stop_loss_price: Price at which to automatically exit at a loss (REQUIRED)
-        take_profit_price: Price at which to automatically take profit (REQUIRED)
+        direction: 'long' (buy low, sell high) or 'short' (sell high, buy low)
+        quantity: Number of units to trade
+        stop_loss_price: Price at which to automatically exit at a loss (REQUIRED).
+            For longs: below entry. For shorts: above entry.
+        take_profit_price: Price at which to automatically take profit (REQUIRED).
+            For longs: above entry. For shorts: below entry.
         time_stop_minutes: Maximum minutes to hold (0 = no time limit)
         thesis: Why you're entering this trade (e.g., 'MACD bullish crossover with expanding volume')
         confidence: Your confidence level 0.0-1.0 (default 0.5)
@@ -1134,33 +1246,46 @@ def create_trading_plan(
         return f"Trade rejected: {cd_msg}"
 
     # Validate direction
-    if direction not in ("long",):
-        return "Only 'long' direction is currently supported."
+    if direction not in ("long", "short"):
+        return "Direction must be 'long' or 'short'."
 
     # Validate stops
-    if direction == "long":
-        pe = store.price_book.get(product_id.upper())
-        if pe:
-            current = float(pe["price"])
+    pe = store.price_book.get(product_id.upper())
+    if pe:
+        current = float(pe["price"])
+        if direction == "long":
             if stop_loss_price >= current:
                 return f"Stop-loss (${stop_loss_price:.6f}) must be below current price (${current:.6f}) for long."
             if take_profit_price <= current:
                 return f"Take-profit (${take_profit_price:.6f}) must be above current price (${current:.6f}) for long."
+        else:  # short
+            if stop_loss_price <= current:
+                return f"Stop-loss (${stop_loss_price:.6f}) must be above current price (${current:.6f}) for short."
+            if take_profit_price >= current:
+                return f"Take-profit (${take_profit_price:.6f}) must be below current price (${current:.6f}) for short."
 
-    # Execute the entry trade
+    # Execute the entry trade: buy for long, sell for short
+    entry_action = "buy" if direction == "long" else "sell"
     latency: float | None = None
     if isinstance(ctx.deps, dict) and "invoked_at" in ctx.deps:
         latency = time.time() - ctx.deps["invoked_at"]
-    trade_msg = _execute_trade(agent_id, product_id, quantity, "buy", latency=latency)
+    trade_msg = _execute_trade(agent_id, product_id, quantity, entry_action, latency=latency)
     if "Insufficient" in trade_msg or "Invalid" in trade_msg or "error" in trade_msg.lower():
         return f"Trade failed: {trade_msg}"
 
     # Extract actual fill price from trade message
-    # Message format: "Bought X PRODUCT @ $PRICE for $COST. Fee: $FEE. Cash remaining: $CASH."
+    # Formats: "Bought X @ $PRICE for ..." or "Short sold X @ $PRICE ($...)"
     entry_price = 0.0
     try:
         at_idx = trade_msg.index("@ $")
-        price_str = trade_msg[at_idx + 3:trade_msg.index(" for")]
+        rest = trade_msg[at_idx + 3:]
+        # Find the next space or paren after the price
+        end = len(rest)
+        for ch in (" ", "("):
+            idx = rest.find(ch)
+            if idx != -1 and idx < end:
+                end = idx
+        price_str = rest[:end]
         entry_price = float(price_str.replace(",", ""))
     except (ValueError, IndexError):
         pe = store.price_book.get(product_id.upper())
