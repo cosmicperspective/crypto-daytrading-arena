@@ -24,6 +24,7 @@ import uvicorn
 load_dotenv()
 
 DB_PATH = Path(__file__).parent / "arena.db"
+PAUSE_FILE = Path(__file__).parent / "arena.pause"
 INITIAL_CASH = 200.0
 START_TIME = time.time()
 
@@ -253,6 +254,7 @@ def query_db() -> dict:
         "trades": trades,
         "balance_series": balance_series,
         "live_prices": live_prices,
+        "paused": PAUSE_FILE.exists(),
         "mode": mode,
         "mode_label": mode_label,
         "llm_spend": {
@@ -686,9 +688,15 @@ HTML = """<!DOCTYPE html>
       <div><span id="spend-model">openrouter</span></div>
     </div>
   </div>
+  <button id="pause-btn" onclick="togglePause()" style="
+    padding:6px 18px; border-radius:20px; font-size:12px; font-weight:700;
+    text-transform:uppercase; letter-spacing:0.5px; cursor:pointer;
+    border:2px solid #22c55e; background:transparent; color:#22c55e;
+    transition: all 0.2s;
+  ">RUNNING</button>
   <div class="live-badge">
-    <div class="live-dot"></div>
-    <span>LIVE</span>
+    <div class="live-dot" id="live-dot"></div>
+    <span id="live-label">LIVE</span>
     <span id="clock" style="margin-left:12px; font-family:monospace;"></span>
     <span id="update-count" style="margin-left:12px; color:#64748b;"></span>
   </div>
@@ -1132,6 +1140,41 @@ function connect() {
   ws.onerror = () => ws.close();
 }
 connect();
+
+let isPaused = false;
+async function togglePause() {
+  const url = isPaused ? '/api/resume' : '/api/pause';
+  await fetch(url, {method: 'POST'});
+  isPaused = !isPaused;
+  updatePauseUI();
+}
+function updatePauseUI() {
+  const btn = document.getElementById('pause-btn');
+  const dot = document.getElementById('live-dot');
+  const label = document.getElementById('live-label');
+  if (isPaused) {
+    btn.textContent = 'PAUSED';
+    btn.style.borderColor = '#ef4444';
+    btn.style.color = '#ef4444';
+    if (dot) { dot.style.background = '#ef4444'; dot.style.boxShadow = '0 0 8px #ef4444'; }
+    if (label) label.textContent = 'PAUSED';
+  } else {
+    btn.textContent = 'RUNNING';
+    btn.style.borderColor = '#22c55e';
+    btn.style.color = '#22c55e';
+    if (dot) { dot.style.background = '#22c55e'; dot.style.boxShadow = '0 0 8px #22c55e'; }
+    if (label) label.textContent = 'LIVE';
+  }
+}
+// Sync pause state from server data
+const _origRender = render;
+render = function(data) {
+  if (data.paused !== undefined && data.paused !== isPaused) {
+    isPaused = data.paused;
+    updatePauseUI();
+  }
+  _origRender(data);
+};
 </script>
 </body>
 </html>"""
@@ -1140,6 +1183,23 @@ connect();
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML
+
+
+@app.post("/api/pause")
+async def pause_arena():
+    PAUSE_FILE.touch()
+    return {"status": "paused"}
+
+
+@app.post("/api/resume")
+async def resume_arena():
+    PAUSE_FILE.unlink(missing_ok=True)
+    return {"status": "running"}
+
+
+@app.get("/api/status")
+async def arena_status():
+    return {"paused": PAUSE_FILE.exists()}
 
 
 @app.websocket("/ws")

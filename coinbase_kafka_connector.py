@@ -26,6 +26,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import websockets
 from pydantic import BaseModel
@@ -50,6 +51,8 @@ DEFAULT_PRODUCTS = [
 RECONNECT_DELAY_SECONDS = 3
 
 PRICE_TOPIC = "market_data.prices"
+
+PAUSE_FILE = Path(__file__).parent / "arena.pause"
 
 
 class TickerMessage(BaseModel):
@@ -171,6 +174,10 @@ class CoinbaseKafkaConnector:
     async def _publish_latest(self) -> None:
         """Snapshot and publish the current latest tickers as a single batch."""
         if not self._latest:
+            return
+
+        if PAUSE_FILE.exists():
+            logger.debug("Arena paused — skipping publish")
             return
 
         if not self._prices_changed_enough():

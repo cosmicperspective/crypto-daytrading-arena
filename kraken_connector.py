@@ -22,6 +22,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import httpx
 import websockets
@@ -79,6 +80,8 @@ INTERNAL_TO_KRAKEN_REST = {
 PRICE_TOPIC = "market_data.prices"
 
 RECONNECT_DELAY_SECONDS = 3
+
+PAUSE_FILE = Path(__file__).parent / "arena.pause"
 
 # Kraken OHLC intervals (minutes) → Coinbase-style granularity (seconds)
 KRAKEN_INTERVAL_MAP = {
@@ -197,6 +200,10 @@ class KrakenKafkaConnector:
 
     async def _publish_latest(self) -> None:
         if not self._latest:
+            return
+
+        if PAUSE_FILE.exists():
+            logger.debug("Arena paused — skipping publish")
             return
 
         if not self._prices_changed_enough():
