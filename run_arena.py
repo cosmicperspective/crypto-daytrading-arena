@@ -23,6 +23,11 @@ MODE_PRESETS = {
         "tests_file": "arena_llm.json",
         "description": "LLM Competition — multiple models, 1 neutral strategy",
     },
+    "v2": {
+        "models_file": "models_llm.json",
+        "tests_file": "arena_v2.json",
+        "description": "V2 A/B Test — 5 models × 2 modes (v1 dumb vs v2 smart) = 10 agents",
+    },
 }
 
 
@@ -41,6 +46,7 @@ class AgentSpec:
     strategy: str
     provider: str
     model_id: str
+    agent_mode: str = "v1"  # "v1" or "v2"
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -75,6 +81,7 @@ def _load_agents(path: str) -> tuple[str, list[AgentSpec]]:
                 strategy=item["strategy"],
                 provider=item.get("provider", "unknown"),
                 model_id=item.get("model_id", "unknown"),
+                agent_mode=item.get("agent_mode", "v1"),
             )
         )
     return bootstrap, agents
@@ -259,11 +266,13 @@ def main() -> None:
                 "--name", agent.agent_name,
                 "--chat-node-name", agent.chat_node_name,
                 "--strategy", agent.strategy,
+                "--agent-mode", agent.agent_mode,
                 "--bootstrap-servers", bootstrap,
                 "--provider", agent.provider,
                 "--model-id", agent.model_id,
             ]
-            print(f"  [router] {agent.agent_name} ({agent.strategy}) -> {agent.chat_node_name}")
+            mode_tag = f" [{agent.agent_mode}]" if agent.agent_mode != "v1" else ""
+            print(f"  [router] {agent.agent_name} ({agent.strategy}{mode_tag}) -> {agent.chat_node_name}")
             p = _spawn(cmd, f"router_{agent.agent_name}", args.log_dir, args.dry_run)
             if p:
                 procs.append(p)

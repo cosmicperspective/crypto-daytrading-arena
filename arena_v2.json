@@ -1,0 +1,85 @@
+{
+  "bootstrap_servers": "localhost:9092",
+  "agents": [
+    {
+      "agent_name": "gemini-v1",
+      "chat_node_name": "gemini-flash",
+      "strategy": "neutral",
+      "agent_mode": "v1",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    },
+    {
+      "agent_name": "gemini-v2",
+      "chat_node_name": "gemini-flash",
+      "strategy": "smart",
+      "agent_mode": "v2",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    },
+    {
+      "agent_name": "gpt5nano-v1",
+      "chat_node_name": "gpt5-nano",
+      "strategy": "neutral",
+      "agent_mode": "v1",
+      "provider": "openrouter",
+      "model_id": "openai/gpt-5-nano"
+    },
+    {
+      "agent_name": "gpt5nano-v2",
+      "chat_node_name": "gpt5-nano",
+      "strategy": "smart",
+      "agent_mode": "v2",
+      "provider": "openrouter",
+      "model_id": "openai/gpt-5-nano"
+    },
+    {
+      "agent_name": "minimax-v1",
+      "chat_node_name": "minimax-m25",
+      "strategy": "neutral",
+      "agent_mode": "v1",
+      "provider": "openrouter",
+      "model_id": "minimax/minimax-m2.5"
+    },
+    {
+      "agent_name": "minimax-v2",
+      "chat_node_name": "minimax-m25",
+      "strategy": "smart",
+      "agent_mode": "v2",
+      "provider": "openrouter",
+      "model_id": "minimax/minimax-m2.5"
+    },
+    {
+      "agent_name": "grok-v1",
+      "chat_node_name": "grok-fast",
+      "strategy": "neutral",
+      "agent_mode": "v1",
+      "provider": "openrouter",
+      "model_id": "x-ai/grok-4.1-fast"
+    },
+    {
+      "agent_name": "grok-v2",
+      "chat_node_name": "grok-fast",
+      "strategy": "smart",
+      "agent_mode": "v2",
+      "provider": "openrouter",
+      "model_id": "x-ai/grok-4.1-fast"
+    },
+    {
+      "agent_name": "haiku-v1",
+      "chat_node_name": "haiku",
+      "strategy": "neutral",
+      "agent_mode": "v1",
+      "provider": "openrouter",
+      "model_id": "anthropic/claude-haiku-4.5"
+    },
+    {
+      "agent_name": "haiku-v2",
+      "chat_node_name": "haiku",
+      "strategy": "smart",
+      "agent_mode": "v2",
+      "provider": "openrouter",
+      "model_id": "anthropic/claude-haiku-4.5"
+    }
+  ]
+}

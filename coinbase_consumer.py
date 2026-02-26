@@ -207,12 +207,16 @@ async def poll_rest(
     price_book: PriceBook,
     candle_book: CandleBook,
     interval: float = 60.0,
+    timeframes: list[Timeframe] | None = None,
 ) -> None:
     """Poll Coinbase REST API for multi-timeframe candles and current prices.
 
     Runs indefinitely, fetching candles at each configured timeframe and
     the latest ticker for each product every ``interval`` seconds.
+
+    If *timeframes* is provided it overrides the default ``TIMEFRAMES``.
     """
+    tfs = timeframes if timeframes is not None else TIMEFRAMES
     async with httpx.AsyncClient(base_url=COINBASE_REST_BASE, timeout=15.0) as client:
         while True:
             now = int(datetime.now(timezone.utc).timestamp())
@@ -220,7 +224,7 @@ async def poll_rest(
             for product_id in products:
                 try:
                     # Fetch candles for each timeframe
-                    for tf in TIMEFRAMES:
+                    for tf in tfs:
                         start = now - tf.start_minutes_ago * 60
                         end = now - tf.end_minutes_ago * 60
                         resp = await client.get(

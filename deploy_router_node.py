@@ -24,7 +24,10 @@ from calfkit.nodes.agent_router_node import AgentRouterNode
 from calfkit.nodes.chat_node import ChatNode
 from calfkit.runners.service import NodesService
 from calfkit.stores.in_memory import InMemoryMessageHistoryStore
-from trading_tools import calculator, execute_trade, get_portfolio, get_trade_history, get_performance_stats
+from trading_tools import (
+    calculator, execute_trade, get_portfolio, get_trade_history, get_performance_stats,
+    get_market_intel, create_trading_plan, modify_plan, get_agent_state, record_learning,
+)
 from agent_registry import AGENT_REGISTRY_TOPIC, AgentMeta
 
 _MEMORY_ADDENDUM = (
@@ -133,7 +136,46 @@ STRATEGIES: dict[str, str] = {
     )
     + _MEMORY_ADDENDUM
     + _REASONING_ADDENDUM,
+    "smart": (
+        "You are a V2 Smart crypto day trader with access to pre-computed technical "
+        "analysis, trading plans with automatic stop-loss/take-profit, and persistent "
+        "strategic memory.  You are competing against both other AI models AND against "
+        "'dumb' versions of yourself that only see raw candle data.\n\n"
+        "YOUR EDGE: You have tools that pre-compute RSI, MACD, Bollinger Bands, EMAs, "
+        "ATR, volume analysis, market regime detection, support/resistance levels, and "
+        "an overall signal.  Use these instead of trying to interpret raw numbers.\n\n"
+        "WORKFLOW (every tick):\n"
+        "1. Call get_market_intel — get signal briefs with indicators and regime\n"
+        "2. Call get_agent_state — see your active plans, learnings, cooldown status\n"
+        "3. Call get_portfolio — see your current holdings\n"
+        "4. DECIDE:\n"
+        "   - If signal is BUY and no active plan: create_trading_plan with stop/TP\n"
+        "   - If active plan is profitable: consider tightening stop via modify_plan\n"
+        "   - If signal conflicts with your plan thesis: close early via modify_plan\n"
+        "   - If no clear signal: WAIT. Patience is an edge.\n"
+        "5. Call record_learning if you notice a useful pattern\n\n"
+        "RULES:\n"
+        "- ALWAYS use create_trading_plan instead of execute_trade (plans have auto stops)\n"
+        "- Set stop-loss using ATR (e.g., entry - 1.5*ATR)\n"
+        "- Set take-profit at 2-3x your risk (e.g., entry + 3*ATR)\n"
+        "- Time-stop at 30-60 min — if it hasn't moved, thesis may be wrong\n"
+        "- Trade ONLY when regime is TRENDING or BREAKOUT with volume confirmation\n"
+        "- Skip RANGING markets — fees will eat you alive\n"
+        "- After 2 consecutive losses, you'll be put on cooldown automatically\n\n"
+        "The risk engine monitors your stops automatically — you do NOT need to "
+        "manually sell when a stop is hit.  Focus on entries and plan management."
+    )
+    + _REASONING_ADDENDUM,
 }
+
+# V1 tools: basic trading tools
+V1_TOOLS = [execute_trade, get_portfolio, get_trade_history, get_performance_stats, calculator]
+
+# V2 tools: basic + market intel + trading plans + risk management + learnings
+V2_TOOLS = [
+    execute_trade, get_portfolio, get_trade_history, get_performance_stats, calculator,
+    get_market_intel, create_trading_plan, modify_plan, get_agent_state, record_learning,
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +209,12 @@ def parse_args() -> argparse.Namespace:
         help="Trading strategy (selects system prompt)",
     )
     parser.add_argument(
+        "--agent-mode",
+        choices=["v1", "v2"],
+        default="v1",
+        help="Agent mode: v1 (basic tools) or v2 (smart tools with market intel + plans).",
+    )
+    parser.add_argument(
         "--bootstrap-servers",
         required=True,
         help="Kafka bootstrap servers address",
@@ -194,7 +242,7 @@ async def main() -> None:
     # ChatNode reference for topic routing (deployed separately via deploy_chat_node.py)
     chat_node = ChatNode(name=args.chat_node_name)
 
-    tools = [execute_trade, get_portfolio, get_trade_history, get_performance_stats, calculator]
+    tools = V2_TOOLS if args.agent_mode == "v2" else V1_TOOLS
     router = AgentRouterNode(
         chat_node=chat_node,
         tool_nodes=tools,

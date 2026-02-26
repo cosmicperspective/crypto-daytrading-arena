@@ -74,6 +74,37 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_price_history_product_ts
                 ON price_history(product_id, ts);
+
+            CREATE TABLE IF NOT EXISTS trading_plans (
+                plan_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                stop_loss_price REAL NOT NULL,
+                take_profit_price REAL NOT NULL,
+                time_stop_minutes INTEGER NOT NULL,
+                thesis TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at REAL NOT NULL,
+                closed_at REAL,
+                exit_price REAL,
+                exit_reason TEXT,
+                pnl REAL NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_plans_agent
+                ON trading_plans(agent_id, status);
+
+            CREATE TABLE IF NOT EXISTS learnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                insight TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_learnings_agent
+                ON learnings(agent_id);
             """
         )
         self._conn.commit()
@@ -254,3 +285,73 @@ class SQLiteStore:
                 started_at=row["started_at"],
             )
         return meta
+
+    # ── Trading plans ────────────────────────────────────────────
+
+    def save_plan(self, plan) -> None:
+        """Upsert a TradingPlan (from risk_engine module)."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO trading_plans("
+            "  plan_id, agent_id, product_id, direction, quantity, entry_price,"
+            "  stop_loss_price, take_profit_price, time_stop_minutes, thesis,"
+            "  confidence, status, created_at, closed_at, exit_price, exit_reason, pnl"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(plan_id) DO UPDATE SET "
+            "  stop_loss_price=excluded.stop_loss_price,"
+            "  take_profit_price=excluded.take_profit_price,"
+            "  status=excluded.status, closed_at=excluded.closed_at,"
+            "  exit_price=excluded.exit_price, exit_reason=excluded.exit_reason,"
+            "  pnl=excluded.pnl",
+            (
+                plan.plan_id, plan.agent_id, plan.product_id, plan.direction,
+                plan.quantity, plan.entry_price, plan.stop_loss_price,
+                plan.take_profit_price, plan.time_stop_minutes, plan.thesis,
+                plan.confidence, plan.status.value if hasattr(plan.status, 'value') else plan.status,
+                plan.created_at, plan.closed_at, plan.exit_price,
+                plan.exit_reason, plan.pnl,
+            ),
+        )
+        self._conn.commit()
+
+    def load_active_plans(self) -> list[dict]:
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            "SELECT * FROM trading_plans WHERE status = 'active'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def load_completed_plans(self, agent_id: str | None = None, limit: int = 20) -> list[dict]:
+        cur = self._conn.cursor()
+        if agent_id:
+            rows = cur.execute(
+                "SELECT * FROM trading_plans WHERE agent_id = ? AND status != 'active' "
+                "ORDER BY closed_at DESC LIMIT ?",
+                (agent_id, limit),
+            ).fetchall()
+        else:
+            rows = cur.execute(
+                "SELECT * FROM trading_plans WHERE status != 'active' "
+                "ORDER BY closed_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ── Learnings ────────────────────────────────────────────────
+
+    def save_learning(self, agent_id: str, insight: str) -> None:
+        cur = self._conn.cursor()
+        import time as _time
+        cur.execute(
+            "INSERT INTO learnings(agent_id, insight, created_at) VALUES(?, ?, ?)",
+            (agent_id, insight, _time.time()),
+        )
+        self._conn.commit()
+
+    def load_learnings(self, agent_id: str, limit: int = 20) -> list[str]:
+        cur = self._conn.cursor()
+        rows = cur.execute(
+            "SELECT insight FROM learnings WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+            (agent_id, limit),
+        ).fetchall()
+        return [row["insight"] for row in rows]

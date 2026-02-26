@@ -204,7 +204,10 @@ def query_db() -> dict:
     # Detect competition mode from agent data
     strategies = set(a["strategy"] for a in agents.values())
     models_set = set(a["model_id"] for a in agents.values())
-    if len(strategies) == 1 and len(models_set) > 1:
+    if strategies == {"neutral", "smart"} and len(models_set) > 1:
+        mode = "v2"
+        mode_label = "V2 A/B Test (Dumb vs Smart)"
+    elif len(strategies) == 1 and len(models_set) > 1:
         mode = "llm"
         mode_label = "LLM Competition"
     elif len(strategies) > 1:
@@ -372,6 +375,7 @@ HTML = """<!DOCTYPE html>
   .strategy-brainrot { background: #3b1e3a; color: #f472b6; }
   .strategy-scalper { background: #3b351e; color: #fbbf24; }
   .strategy-neutral { background: #2a2a3a; color: #a78bfa; }
+  .strategy-smart { background: #1a0d2e; color: #c084fc; border: 1px solid #7c3aed; }
   .positive { color: #00ff88; }
   .negative { color: #ff4757; }
   .neutral { color: #8892b0; }
@@ -771,6 +775,12 @@ const COLORS = {
   'agent-minimax': '#f472b6',
   'agent-grok': '#fbbf24',
   'agent-haiku': '#a78bfa',
+  // V2 A/B mode agents (v1=muted, v2=vivid)
+  'gemini-v1': '#3b6ea0', 'gemini-v2': '#60a5fa',
+  'gpt5nano-v1': '#1f8a66', 'gpt5nano-v2': '#34d399',
+  'minimax-v1': '#a04878', 'minimax-v2': '#f472b6',
+  'grok-v1': '#a0871a', 'grok-v2': '#fbbf24',
+  'haiku-v1': '#6b5a9e', 'haiku-v2': '#a78bfa',
 };
 const STRATEGY_CLASS = {
   'default': 'strategy-default',
@@ -778,6 +788,7 @@ const STRATEGY_CLASS = {
   'brainrot': 'strategy-brainrot',
   'scalper': 'strategy-scalper',
   'neutral': 'strategy-neutral',
+  'smart': 'strategy-smart',
 };
 
 const STRATEGY_GUIDE = {
@@ -963,7 +974,12 @@ function render(data) {
 
   // Mode badge
   const modeBadge = document.getElementById('mode-badge');
-  if (data.mode === 'llm') {
+  if (data.mode === 'v2') {
+    modeBadge.textContent = 'V2 A/B Test';
+    modeBadge.style.background = '#1a0d2e';
+    modeBadge.style.borderColor = '#c084fc';
+    modeBadge.style.color = '#c084fc';
+  } else if (data.mode === 'llm') {
     modeBadge.textContent = 'LLM Competition';
     modeBadge.style.background = '#1e1535';
     modeBadge.style.borderColor = '#a78bfa';
@@ -979,7 +995,42 @@ function render(data) {
 
   // Dynamic guide section
   const guide = document.getElementById('guide-section');
-  if (data.mode === 'llm') {
+  if (data.mode === 'v2') {
+    // V2 A/B mode: show comparison cards for each model
+    const models = [...new Set(Object.values(data.agents).map(a => a.model_id))];
+    guide.innerHTML = `
+      <div class="strat-card" style="border-top-color:#c084fc;grid-column:1/-1">
+        <h3>V2 A/B Test: Dumb vs Smart</h3>
+        <div class="strat-subtitle" style="color:#c084fc">Each model runs in both V1 (raw candles) and V2 (signal briefs + plans + risk engine)</div>
+        <ul>
+          <li><strong style="color:#64748b">V1 Dumb:</strong> Raw candle data, basic tools (execute_trade, get_portfolio)</li>
+          <li><strong style="color:#c084fc">V2 Smart:</strong> Pre-computed indicators (RSI, MACD, Bollinger, regime), trading plans with auto stop-loss/TP, persistent learnings</li>
+          <li>Same model, same market data &mdash; only the intelligence layer differs</li>
+          <li>Risk engine automatically exits at stop-loss/take-profit for V2 agents</li>
+        </ul>
+      </div>
+    ` + models.map(mid => {
+      const info = LLM_GUIDE[mid] || {color:'#8892b0', title:mid, provider:'Unknown', desc:''};
+      // Find v1 and v2 agents for this model
+      const v1 = Object.entries(data.agents).find(([id,a]) => a.model_id === mid && a.strategy === 'neutral');
+      const v2 = Object.entries(data.agents).find(([id,a]) => a.model_id === mid && a.strategy === 'smart');
+      const v1val = v1 ? v1[1].total_value : 200;
+      const v2val = v2 ? v2[1].total_value : 200;
+      const v1roi = ((v1val - 200) / 200 * 100).toFixed(2);
+      const v2roi = ((v2val - 200) / 200 * 100).toFixed(2);
+      const winner = v2val > v1val ? 'V2 Smart' : v1val > v2val ? 'V1 Dumb' : 'Tied';
+      const winColor = v2val > v1val ? '#c084fc' : v1val > v2val ? '#64748b' : '#fbbf24';
+      return `<div class="strat-card" style="border-top-color:${info.color}">
+        <h3>${info.title}</h3>
+        <div class="strat-subtitle" style="color:${info.color}">${info.provider}</div>
+        <ul>
+          <li>V1 Dumb: <strong class="${v1roi >= 0 ? 'positive' : 'negative'}">${v1roi >= 0 ? '+' : ''}${v1roi}%</strong> ROI</li>
+          <li>V2 Smart: <strong class="${v2roi >= 0 ? 'positive' : 'negative'}">${v2roi >= 0 ? '+' : ''}${v2roi}%</strong> ROI</li>
+        </ul>
+        <div class="strat-note" style="color:${winColor}">Leading: ${winner}</div>
+      </div>`;
+    }).join('');
+  } else if (data.mode === 'llm') {
     // LLM mode: show model cards
     const models = [...new Set(Object.values(data.agents).map(a => a.model_id))];
     guide.innerHTML = models.map(mid => {

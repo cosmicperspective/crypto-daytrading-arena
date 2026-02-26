@@ -40,7 +40,7 @@ from calfkit.broker.broker import BrokerClient
 from calfkit.models.tool_context import ToolContext
 from calfkit.nodes.base_tool_node import agent_tool
 from calfkit.runners.service import NodesService
-from coinbase_consumer import PriceBook
+from coinbase_consumer import CandleBook, PriceBook
 from agent_registry import AgentMeta
 from sim_config import SimConfig, load_sim_config
 from persistence import SQLiteStore
@@ -1049,6 +1049,256 @@ def calculator(ctx: ToolContext, expression: str) -> str:
         return str(result.evalf() if not result.is_number else result)
     except (sympy.SympifyError, TypeError) as e:
         return f"Invalid expression: {e}"
+
+
+# ── V2 services (initialised lazily by tools_and_dashboard.py) ──
+
+_market_intel_service = None  # type: ignore[assignment]
+_risk_engine = None  # type: ignore[assignment]
+
+
+def init_v2_services(market_intel, risk_eng) -> None:
+    """Called once from tools_and_dashboard.py to wire V2 singletons."""
+    global _market_intel_service, _risk_engine
+    _market_intel_service = market_intel
+    _risk_engine = risk_eng
+
+
+# ── V2 agent tools ──────────────────────────────────────────────
+
+
+@agent_tool
+def get_market_intel(ctx: ToolContext) -> str:
+    """Get pre-computed technical analysis for all tracked products.
+
+    Returns narrative signal briefs with indicators (RSI, MACD, Bollinger,
+    EMAs, ATR, volume), market regime detection (trending/ranging/volatile/
+    breakout/capitulation), support/resistance levels, and an overall
+    buy/sell/hold signal.
+
+    This is much more useful than raw candlestick data — the math is already
+    done for you.  Call this FIRST on every tick before making decisions.
+
+    Returns:
+        Signal briefs for all products with regime, indicators, and signals.
+    """
+    if _market_intel_service is None:
+        return "Market intelligence service not available."
+    from coinbase_kafka_connector import DEFAULT_PRODUCTS
+    return _market_intel_service.format_all_briefs(DEFAULT_PRODUCTS)
+
+
+@agent_tool
+def create_trading_plan(
+    ctx: ToolContext,
+    product_id: str,
+    direction: str,
+    quantity: float,
+    stop_loss_price: float,
+    take_profit_price: float,
+    time_stop_minutes: int,
+    thesis: str,
+    confidence: float = 0.5,
+) -> str:
+    """Enter a trade AND register a trading plan with automatic stop-loss/take-profit.
+
+    The risk engine will monitor your plan and automatically exit when:
+    - Price hits your stop-loss (loss limited)
+    - Price hits your take-profit (profit secured)
+    - Time expires (forced exit after time_stop_minutes)
+
+    You do NOT need to manually sell — the risk engine handles exits.
+    Use modify_plan to tighten stops or adjust targets while the trade is active.
+
+    Args:
+        product_id: Trading pair (e.g., DOGE-USD)
+        direction: 'long' (buy low, sell high)
+        quantity: Number of units to buy
+        stop_loss_price: Price at which to automatically exit at a loss (REQUIRED)
+        take_profit_price: Price at which to automatically take profit (REQUIRED)
+        time_stop_minutes: Maximum minutes to hold (0 = no time limit)
+        thesis: Why you're entering this trade (e.g., 'MACD bullish crossover with expanding volume')
+        confidence: Your confidence level 0.0-1.0 (default 0.5)
+
+    Returns:
+        Trade confirmation with plan ID, or error message
+    """
+    if _risk_engine is None:
+        return "Risk engine not available. Use execute_trade instead."
+
+    agent_id = ctx.agent_name
+
+    # Check cooldown
+    on_cd, cd_msg = _risk_engine.is_agent_on_cooldown(agent_id)
+    if on_cd:
+        return f"Trade rejected: {cd_msg}"
+
+    # Validate direction
+    if direction not in ("long",):
+        return "Only 'long' direction is currently supported."
+
+    # Validate stops
+    if direction == "long":
+        pe = store.price_book.get(product_id.upper())
+        if pe:
+            current = float(pe["price"])
+            if stop_loss_price >= current:
+                return f"Stop-loss (${stop_loss_price:.6f}) must be below current price (${current:.6f}) for long."
+            if take_profit_price <= current:
+                return f"Take-profit (${take_profit_price:.6f}) must be above current price (${current:.6f}) for long."
+
+    # Execute the entry trade
+    latency: float | None = None
+    if isinstance(ctx.deps, dict) and "invoked_at" in ctx.deps:
+        latency = time.time() - ctx.deps["invoked_at"]
+    trade_msg = _execute_trade(agent_id, product_id, quantity, "buy", latency=latency)
+    if "Insufficient" in trade_msg or "Invalid" in trade_msg or "error" in trade_msg.lower():
+        return f"Trade failed: {trade_msg}"
+
+    # Extract actual fill price from trade message
+    # Message format: "Bought X PRODUCT @ $PRICE for $COST. Fee: $FEE. Cash remaining: $CASH."
+    entry_price = 0.0
+    try:
+        at_idx = trade_msg.index("@ $")
+        price_str = trade_msg[at_idx + 3:trade_msg.index(" for")]
+        entry_price = float(price_str.replace(",", ""))
+    except (ValueError, IndexError):
+        pe = store.price_book.get(product_id.upper())
+        entry_price = float(pe["price"]) if pe else 0.0
+
+    # Register plan with risk engine
+    from risk_engine import TradingPlan, new_plan_id
+    plan = TradingPlan(
+        plan_id=new_plan_id(),
+        agent_id=agent_id,
+        product_id=product_id.upper(),
+        direction=direction,
+        quantity=quantity,
+        entry_price=entry_price,
+        stop_loss_price=stop_loss_price,
+        take_profit_price=take_profit_price,
+        time_stop_minutes=time_stop_minutes,
+        thesis=thesis,
+        confidence=confidence,
+    )
+    _risk_engine.register_plan(plan)
+
+    # Persist plan
+    if _persistence is not None:
+        _persistence.save_plan(plan)
+
+    return (
+        f"{trade_msg}\n\n"
+        f"Trading plan registered: [{plan.plan_id}]\n"
+        f"  Stop-loss: ${stop_loss_price:.6f} | Take-profit: ${take_profit_price:.6f}\n"
+        f"  Time stop: {time_stop_minutes} min | Thesis: {thesis}"
+    )
+
+
+@agent_tool
+def modify_plan(
+    ctx: ToolContext,
+    plan_id: str,
+    action: str = "tighten_stop",
+    new_stop_loss: float | None = None,
+    new_take_profit: float | None = None,
+) -> str:
+    """Modify an active trading plan.
+
+    Actions:
+    - 'tighten_stop': Move stop-loss closer to current price (lock in gains)
+    - 'adjust_tp': Change take-profit target
+    - 'close': Close the plan and exit the trade immediately
+
+    Args:
+        plan_id: The plan ID (8-char hex from create_trading_plan)
+        action: 'tighten_stop', 'adjust_tp', or 'close'
+        new_stop_loss: New stop-loss price (for tighten_stop)
+        new_take_profit: New take-profit price (for adjust_tp)
+
+    Returns:
+        Confirmation or error message
+    """
+    if _risk_engine is None:
+        return "Risk engine not available."
+
+    if action == "close":
+        ok, msg = _risk_engine.close_plan(plan_id, reason="agent_closed")
+        if _persistence is not None:
+            plan = None
+            for p in _risk_engine._completed:
+                if p.plan_id == plan_id:
+                    plan = p
+                    break
+            if plan:
+                _persistence.save_plan(plan)
+        return msg if ok else f"Failed: {msg}"
+
+    ok, msg = _risk_engine.modify_plan(plan_id, new_stop_loss, new_take_profit)
+    if ok and _persistence is not None:
+        plan = _risk_engine._plans.get(plan_id)
+        if plan:
+            _persistence.save_plan(plan)
+    return msg if ok else f"Failed: {msg}"
+
+
+@agent_tool
+def get_agent_state(ctx: ToolContext) -> str:
+    """Get your current V2 trading state: active plans, recent completed plans,
+    cooldown status, and saved learnings.
+
+    Call this alongside get_market_intel to have full context before deciding.
+
+    Returns:
+        Active plans with P&L, completed plans, cooldown status, and your learnings.
+    """
+    agent_id = ctx.agent_name
+    parts: list[str] = []
+
+    # Risk engine state (plans)
+    if _risk_engine is not None:
+        parts.append(_risk_engine.get_agent_state_text(agent_id))
+    else:
+        parts.append("Risk engine not available.")
+
+    # Learnings
+    if _persistence is not None:
+        learnings = _persistence.load_learnings(agent_id, limit=10)
+        if learnings:
+            parts.append("\nYour Learnings:")
+            for i, l in enumerate(learnings, 1):
+                parts.append(f"  {i}. {l}")
+        else:
+            parts.append("\nNo learnings recorded yet. Use record_learning to save insights.")
+
+    return "\n".join(parts)
+
+
+@agent_tool
+def record_learning(ctx: ToolContext, insight: str) -> str:
+    """Save a strategic insight that will persist across ticks.
+
+    Use this to record patterns you've observed, what works/doesn't work,
+    or regime-specific strategies.  Your learnings will be shown to you
+    on every future tick via get_agent_state.
+
+    Examples:
+    - 'DOGE momentum trades win 65% but mean-reversion only 30%'
+    - 'PEPE mean-reverts after RSI > 75 in ranging markets'
+    - 'Volume spikes > 2x precede breakouts — get in early'
+
+    Args:
+        insight: The strategic insight to save (be specific and actionable)
+
+    Returns:
+        Confirmation
+    """
+    agent_id = ctx.agent_name
+    if _persistence is None:
+        return "Persistence not available — learning will be lost."
+    _persistence.save_learning(agent_id, insight)
+    logger.info("LEARNING %s | %s", agent_id, insight[:120])
+    return f"Learning saved: {insight[:80]}..."
 
 
 # ── Entrypoint ───────────────────────────────────────────────────
