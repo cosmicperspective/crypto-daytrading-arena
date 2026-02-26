@@ -242,7 +242,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Crypto Arena Dashboard</title>
+<title>Darwin</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -639,7 +639,7 @@ HTML = """<!DOCTYPE html>
 <body>
 
 <div class="header">
-  <h1>Crypto Daytrading Arena</h1>
+  <h1>Darwin</h1>
   <div id="mode-badge" style="padding:4px 14px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;border:1px solid #334155;color:#8892b0;"></div>
   <div class="spend-ticker" id="spend-ticker">
     <div>

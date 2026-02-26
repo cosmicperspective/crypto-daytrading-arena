@@ -69,13 +69,8 @@
     DARWIN
   </text>
 
-  <!-- Subtitle -->
-  <text x="400" y="135" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-weight="400" font-size="18" fill="#9ca3af" letter-spacing="8">
-    SURVIVAL OF THE SMARTEST
-  </text>
-
   <!-- Tagline -->
-  <text x="400" y="175" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-weight="300" font-size="13" fill="#6b7280" letter-spacing="2">
+  <text x="400" y="145" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-weight="300" font-size="14" fill="#6b7280" letter-spacing="3">
     AI AGENTS COMPETE  &#x2022;  LIVE CRYPTO  &#x2022;  NATURAL SELECTION
   </text>
 </svg>
