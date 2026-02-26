@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 import typing
 from collections import deque
@@ -40,14 +41,19 @@ from calfkit.models.tool_context import ToolContext
 from calfkit.nodes.base_tool_node import agent_tool
 from calfkit.runners.service import NodesService
 from coinbase_consumer import PriceBook
+from agent_registry import AgentMeta
+from sim_config import SimConfig, load_sim_config
+from persistence import SQLiteStore
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+SIM_CONFIG = load_sim_config()
+SIM_DB_PATH = os.getenv("SIM_DB_PATH", "arena.db").strip()
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────
 
-INITIAL_CASH = 100_000.0
+INITIAL_CASH = 200.0
 
 MAX_BALANCE_HISTORY = 300  # ~25 min at 5s intervals
 
@@ -76,6 +82,14 @@ class AgentAccount:
     # Weighted-average entry timestamp (Unix epoch) per position
     avg_entry_ts: dict[str, float] = field(default_factory=dict)
     trade_count: int = 0
+    realized_pnl: float = 0.0
+    fees_paid: float = 0.0
+    wins: int = 0
+    losses: int = 0
+    equity_peak: float = INITIAL_CASH
+    max_drawdown: float = 0.0
+    last_trade_ts: float | None = None
+    memory_calls: int = 0  # times agent called get_trade_history or get_performance_stats
 
     def portfolio_value(self, price_book: PriceBook) -> float:
         """Total value: cash + mark-to-market of all positions using live prices."""
@@ -100,15 +114,40 @@ class AgentAccount:
 class AccountStore:
     """In-memory trading account store, keyed by agent_id."""
 
-    def __init__(self, price_book: PriceBook) -> None:
+    def __init__(
+        self,
+        price_book: PriceBook,
+        sim_config: SimConfig,
+        persistence: SQLiteStore | None = None,
+    ) -> None:
         self._accounts: dict[str, AgentAccount] = {}
-        self._trade_log: list[tuple[str, str, str, str, float, float, float | None]] = []
+        self._trade_log: list[
+            tuple[str, str, str, str, float, float, float, float | None]
+        ] = []
         self._price_book = price_book
+        self._sim = sim_config
+        self._agent_meta: dict[str, AgentMeta] = {}
+        self._persistence = persistence
+
+        if self._persistence is not None:
+            self._accounts = self._persistence.load_accounts(AgentAccount)
+            self._trade_log = self._persistence.load_trades()
+            self._agent_meta = self._persistence.load_agent_meta()
 
     def get_or_create(self, agent_id: str) -> AgentAccount:
         if agent_id not in self._accounts:
             self._accounts[agent_id] = AgentAccount()
         return self._accounts[agent_id]
+
+    def update_drawdown(self, agent_id: str) -> None:
+        account = self.get_or_create(agent_id)
+        equity = account.portfolio_value(self._price_book)
+        if equity > account.equity_peak:
+            account.equity_peak = equity
+        drawdown = 0.0
+        if account.equity_peak > 0:
+            drawdown = (account.equity_peak - equity) / account.equity_peak
+        account.max_drawdown = max(account.max_drawdown, drawdown)
 
     @property
     def accounts(self) -> dict[str, AgentAccount]:
@@ -119,8 +158,23 @@ class AccountStore:
         return self._price_book
 
     @property
-    def trade_log(self) -> list[tuple[str, str, str, str, float, float, float | None]]:
+    def trade_log(self) -> list[tuple[str, str, str, str, float, float, float, float | None]]:
         return self._trade_log
+
+    @property
+    def sim(self) -> SimConfig:
+        return self._sim
+
+    def set_agent_meta(self, meta: AgentMeta) -> None:
+        self._agent_meta[meta.agent_name] = meta
+        if self._persistence is not None:
+            self._persistence.save_agent_meta(meta)
+
+    def get_agent_meta(self, agent_id: str) -> AgentMeta | None:
+        return self._agent_meta.get(agent_id)
+
+    def get_all_agent_meta(self) -> dict[str, AgentMeta]:
+        return dict(self._agent_meta)
 
     def execute_trade(
         self,
@@ -129,12 +183,18 @@ class AccountStore:
         quantity: float,
         action: str,
         latency: float | None = None,
+        order_type: str = "market",
+        limit_price: float | None = None,
     ) -> TradeResult:
         product_id = product_id.upper().strip()
         action = action.lower().strip()
+        order_type = order_type.lower().strip()
 
         if action not in ("buy", "sell"):
             return TradeResult(False, f"Invalid action '{action}'. Must be 'buy' or 'sell'.")
+
+        if order_type not in ("market", "limit"):
+            return TradeResult(False, f"Invalid order_type '{order_type}'. Must be 'market' or 'limit'.")
 
         entry = self._price_book.get(product_id)
         if entry is None:
@@ -148,42 +208,114 @@ class AccountStore:
         if quantity <= 0:
             return TradeResult(False, "Quantity must be positive.")
 
-        rounded = round(quantity, 1)
+        rounded = round(quantity, 4)
         if abs(quantity - rounded) > 1e-9:
             return TradeResult(
-                False, "Quantity must have at most 1 decimal place (e.g., 0.5, 1.2)."
+                False, "Quantity must have at most 4 decimal places (e.g., 0.5, 0.0015)."
             )
         quantity = rounded
 
         account = self.get_or_create(agent_id)
 
-        if action == "buy":
-            price = float(entry["best_ask"])
-            cost = price * quantity
-            if cost > account.cash:
+        now_ts = datetime.now().timestamp()
+        if account.last_trade_ts is not None:
+            since_last = now_ts - account.last_trade_ts
+            if since_last < self._sim.min_trade_interval_s:
                 return TradeResult(
                     False,
-                    f"Insufficient cash. Need ${cost:,.2f} but only have ${account.cash:,.2f}.",
+                    f"Trade throttled. Wait {self._sim.min_trade_interval_s - since_last:.1f}s.",
                 )
-            account.cash -= cost
+
+        best_ask = float(entry["best_ask"])
+        best_bid = float(entry["best_bid"])
+
+        if order_type == "limit":
+            if limit_price is None:
+                return TradeResult(False, "limit_price is required for limit orders.")
+            if action == "buy" and float(limit_price) < best_ask:
+                return TradeResult(False, "Limit buy not filled (price below best ask).")
+            if action == "sell" and float(limit_price) > best_bid:
+                return TradeResult(False, "Limit sell not filled (price above best bid).")
+
+        if self._sim.simulate_latency_ms > 0:
+            time.sleep(self._sim.simulate_latency_ms / 1000)
+            latency = (latency or 0.0) + (self._sim.simulate_latency_ms / 1000)
+
+        # Partial fill simulation
+        if (
+            self._sim.partial_fill_prob > 0.0
+            and random.random() < self._sim.partial_fill_prob
+        ):
+            ratio = random.uniform(
+                self._sim.partial_fill_min_ratio,
+                self._sim.partial_fill_max_ratio,
+            )
+            quantity = max(0.1, round(quantity * ratio, 1))
+
+        # Slippage + impact model
+        try:
+            vol_24h = float(entry.get("volume_24h", "0") or 0.0)
+        except ValueError:
+            vol_24h = 0.0
+        impact_ratio = min(1.0, quantity / max(vol_24h, 1.0))
+        total_bps = self._sim.slippage_bps + (self._sim.impact_bps * impact_ratio)
+
+        fee_bps = self._sim.taker_fee_bps if order_type == "market" else self._sim.maker_fee_bps
+
+        if action == "buy":
+            base_price = best_ask
+            if order_type == "limit":
+                base_price = min(best_ask, float(limit_price))
+            price = base_price * (1 + total_bps / 10_000)
+            cost = price * quantity
+            fee = cost * (fee_bps / 10_000)
+            if cost + fee > account.cash:
+                if not self._sim.allow_negative_cash:
+                    return TradeResult(
+                        False,
+                        f"Insufficient cash. Need ${cost + fee:,.2f} but only have ${account.cash:,.2f}.",
+                    )
+                equity = account.portfolio_value(self._price_book)
+                max_debit = max(0.0, (self._sim.max_leverage - 1.0) * equity)
+                if cost + fee > account.cash + max_debit:
+                    return TradeResult(
+                        False,
+                        "Insufficient margin for leveraged buy.",
+                    )
+            if self._sim.max_order_usd is not None and cost > self._sim.max_order_usd:
+                return TradeResult(False, f"Order exceeds max_order_usd (${self._sim.max_order_usd:,.0f}).")
+
             existing_qty = account.positions.get(product_id, 0)
-            now_ts = datetime.now().timestamp()
+            new_position_value = (existing_qty + quantity) * price
+            if self._sim.max_position_usd is not None and new_position_value > self._sim.max_position_usd:
+                return TradeResult(
+                    False,
+                    f"Position exceeds max_position_usd (${self._sim.max_position_usd:,.0f}).",
+                )
+
+            account.cash -= (cost + fee)
+            existing_qty = account.positions.get(product_id, 0)
             existing_ts = account.avg_entry_ts.get(product_id, now_ts)
             account.avg_entry_ts[product_id] = (existing_qty * existing_ts + quantity * now_ts) / (
                 existing_qty + quantity
             )
             account.positions[product_id] = existing_qty + quantity
-            account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) + cost
+            account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) + cost + fee
             account.trade_count += 1
-            self._record_trade(agent_id, action, product_id, quantity, price, latency)
+            account.fees_paid += fee
+            account.last_trade_ts = now_ts
+            self._record_trade(agent_id, action, product_id, quantity, price, fee, latency)
             return TradeResult(
                 True,
                 f"Bought {quantity} {product_id} @ ${price:,.2f} for ${cost:,.2f}. "
-                f"Cash remaining: ${account.cash:,.2f}.",
+                f"Fee: ${fee:,.2f}. Cash remaining: ${account.cash:,.2f}.",
             )
 
         # sell
-        price = float(entry["best_bid"])
+        base_price = best_bid
+        if order_type == "limit":
+            base_price = max(best_bid, float(limit_price))
+        price = base_price * (1 - total_bps / 10_000)
         held = account.positions.get(product_id, 0)
         if quantity > held:
             return TradeResult(
@@ -192,12 +324,22 @@ class AccountStore:
                 f"but only hold {held}.",
             )
         proceeds = price * quantity
-        account.cash += proceeds
+        fee = proceeds * (fee_bps / 10_000)
+        if self._sim.max_order_usd is not None and proceeds > self._sim.max_order_usd:
+            return TradeResult(False, f"Order exceeds max_order_usd (${self._sim.max_order_usd:,.0f}).")
+        account.cash += proceeds - fee
         # Reduce cost basis proportionally (average cost method)
         avg_cost = account.avg_cost_per_unit(product_id)
         account.cost_basis[product_id] = account.cost_basis.get(product_id, 0.0) - (
             avg_cost * quantity
         )
+        realized = (price - avg_cost) * quantity - fee
+        account.realized_pnl += realized
+        account.fees_paid += fee
+        if realized >= 0:
+            account.wins += 1
+        else:
+            account.losses += 1
         new_qty = round(held - quantity, 1)
         if new_qty <= 0:
             del account.positions[product_id]
@@ -206,11 +348,12 @@ class AccountStore:
         else:
             account.positions[product_id] = new_qty
         account.trade_count += 1
-        self._record_trade(agent_id, action, product_id, quantity, price, latency)
+        account.last_trade_ts = now_ts
+        self._record_trade(agent_id, action, product_id, quantity, price, fee, latency)
         return TradeResult(
             True,
             f"Sold {quantity} {product_id} @ ${price:,.2f} for ${proceeds:,.2f}. "
-            f"Cash remaining: ${account.cash:,.2f}.",
+            f"Fee: ${fee:,.2f}. Cash remaining: ${account.cash:,.2f}.",
         )
 
     def _record_trade(
@@ -218,12 +361,26 @@ class AccountStore:
         agent_id: str,
         action: str,
         product_id: str,
-        quantity: int,
+        quantity: float,
         price: float,
+        fee: float,
         latency: float | None = None,
     ) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self._trade_log.append((ts, agent_id, action, product_id, quantity, price, latency))
+        self._trade_log.append((ts, agent_id, action, product_id, quantity, price, fee, latency))
+        account = self.get_or_create(agent_id)
+        if self._persistence is not None:
+            self._persistence.save_account(agent_id, account)
+            self._persistence.insert_trade(
+                ts=ts,
+                agent_id=agent_id,
+                action=action,
+                product_id=product_id,
+                qty=quantity,
+                price=price,
+                fee=fee,
+                latency=latency,
+            )
 
 
 # ── Rich Live view ───────────────────────────────────────────────
@@ -298,9 +455,15 @@ class PortfolioView:
         self._store = store
         self._live: Live | None = None
         self._balance_history: dict[str, deque[tuple[str, float]]] = {}
+        self._agent_meta: dict[str, AgentMeta] = self._store.get_all_agent_meta()
 
     def attach_live(self, live: Live) -> None:
         self._live = live
+
+    def update_agent_meta(self, meta: AgentMeta) -> None:
+        self._agent_meta[meta.agent_name] = meta
+        self._store.set_agent_meta(meta)
+        self.rerender()
 
     def rerender(self) -> None:
         if self._live is not None:
@@ -315,6 +478,7 @@ class PortfolioView:
                 self._balance_history[agent_id] = deque(maxlen=MAX_BALANCE_HISTORY)
             value = account.portfolio_value(price_book)
             self._balance_history[agent_id].append((ts, value))
+            self._store.update_drawdown(agent_id)
 
     def _build_layout(self) -> Layout:
         layout = Layout()
@@ -322,14 +486,17 @@ class PortfolioView:
             Layout(name="header", size=3),
             Layout(name="summary_header", size=1),
             Layout(name="summary", size=7),
+            Layout(name="leaderboard", size=9),
             Layout(name="body", ratio=2),
-            Layout(name="chart", size=15),
+            Layout(name="chart", size=12),
+            Layout(name="sim_config", size=5),
         )
         layout["header"].update(self._build_header())
         layout["summary_header"].update(
             Text.from_markup("[bold]Agent Account Summaries[/]", justify="center")
         )
         layout["summary"].update(self._build_summary_cards())
+        layout["leaderboard"].update(self._build_leaderboard())
         layout["body"].split_row(
             Layout(name="positions", ratio=3),
             Layout(name="log", ratio=2),
@@ -337,6 +504,7 @@ class PortfolioView:
         layout["positions"].update(self._build_positions_table())
         layout["log"].update(self._build_trade_log())
         layout["chart"].update(self._build_chart())
+        layout["sim_config"].update(self._build_sim_config())
         return layout
 
     def _build_chart(self) -> Panel:
@@ -381,6 +549,68 @@ class PortfolioView:
             cards.append(Panel("[dim]No accounts yet[/]", border_style="dim"))
 
         return Columns(cards, expand=True, equal=True)
+
+    def _build_leaderboard(self) -> Panel:
+        table = Table(expand=True, show_lines=False, show_header=True)
+        table.add_column("Rank", justify="right", width=4)
+        table.add_column("Agent", ratio=2)
+        table.add_column("Model", ratio=2)
+        table.add_column("Strategy", ratio=2)
+        table.add_column("Total", justify="right", ratio=2)
+        table.add_column("ROI", justify="right", ratio=1)
+        table.add_column("Realized", justify="right", ratio=2)
+        table.add_column("Trades", justify="right", ratio=1)
+        table.add_column("Win%", justify="right", ratio=1)
+        table.add_column("Fees", justify="right", ratio=1)
+        table.add_column("Max DD", justify="right", ratio=1)
+
+        accounts = self._store.accounts
+        price_book = self._store.price_book
+        if not accounts:
+            table.add_row("—", "[dim]No agents yet[/]", "", "", "", "", "", "", "", "", "")
+        else:
+            ranked = sorted(
+                accounts.items(),
+                key=lambda item: item[1].portfolio_value(price_book),
+                reverse=True,
+            )
+            for rank, (agent_id, account) in enumerate(ranked, start=1):
+                total_value = account.portfolio_value(price_book)
+                roi = (total_value - INITIAL_CASH) / INITIAL_CASH
+                win_total = account.wins + account.losses
+                win_rate = (account.wins / win_total) if win_total else 0.0
+                meta = self._agent_meta.get(agent_id)
+                model = meta.model_id if meta else "unknown"
+                strategy = meta.strategy if meta else "unknown"
+                table.add_row(
+                    str(rank),
+                    agent_id,
+                    model,
+                    strategy,
+                    f"${total_value:,.2f}",
+                    f"{roi * 100:+.2f}%",
+                    f"${account.realized_pnl:,.2f}",
+                    str(account.trade_count),
+                    f"{win_rate * 100:.0f}%",
+                    f"${account.fees_paid:,.2f}",
+                    f"{account.max_drawdown * 100:.1f}%",
+                )
+
+        return Panel(table, title="[bold]Leaderboard[/]", border_style="magenta")
+
+    def _build_sim_config(self) -> Panel:
+        sim = self._store.sim
+        lines = [
+            f"Preset: {sim.preset}",
+            f"Taker fee: {sim.taker_fee_bps:.1f} bps | Maker fee: {sim.maker_fee_bps:.1f} bps",
+            f"Slippage: {sim.slippage_bps:.1f} bps | Impact: {sim.impact_bps:.1f} bps",
+            f"Latency: {sim.simulate_latency_ms} ms | Partial fill: {sim.partial_fill_prob * 100:.0f}%",
+            f"Funding: {sim.funding_bps_per_hour:.2f} bps/hr | Borrow: {sim.borrow_bps_per_hour:.2f} bps/hr",
+            f"Max order: {sim.max_order_usd or '∞'} | Max position: {sim.max_position_usd or '∞'}",
+            f"Max leverage: {sim.max_leverage:.2f} | Min interval: {sim.min_trade_interval_s:.1f}s",
+        ]
+        text = Text("\n".join(lines))
+        return Panel(text, title="[bold]Simulation Settings[/]", border_style="blue")
 
     def _build_positions_table(self) -> Panel:
         table = Table(expand=True, show_lines=False)
@@ -475,14 +705,15 @@ class PortfolioView:
         table.add_column("Qty", justify="right", ratio=1)
         table.add_column("Ticker", ratio=2)
         table.add_column("Unit Price", justify="right", ratio=2)
+        table.add_column("Fee", justify="right", ratio=1)
         table.add_column("Agent", style="dim", ratio=2)
         table.add_column("Latency", justify="right", style="dim", ratio=1)
 
         log = self._store.trade_log
         if not log:
-            table.add_row("[dim italic]No trades yet...[/]", "", "", "", "", "", "")
+            table.add_row("[dim italic]No trades yet...[/]", "", "", "", "", "", "", "")
         else:
-            for ts, agent_id, action, product_id, qty, price, latency in reversed(log):
+            for ts, agent_id, action, product_id, qty, price, fee, latency in reversed(log):
                 action_style = "bold green" if action == "buy" else "bold red"
                 latency_str = f"{latency:.1f}s" if latency is not None else ""
                 table.add_row(
@@ -491,6 +722,7 @@ class PortfolioView:
                     f"{qty:g}",
                     product_id,
                     f"${price:,.2f}",
+                    f"${fee:,.2f}",
                     agent_id,
                     latency_str,
                 )
@@ -501,7 +733,8 @@ class PortfolioView:
 # ── Module-level singletons ──────────────────────────────────────
 
 price_book = PriceBook()
-store = AccountStore(price_book)
+_persistence = SQLiteStore(SIM_DB_PATH) if SIM_DB_PATH else None
+store = AccountStore(price_book, SIM_CONFIG, persistence=_persistence)
 view = PortfolioView(store)
 
 
@@ -509,9 +742,26 @@ view = PortfolioView(store)
 
 
 def _execute_trade(
-    agent_id: str, product_id: str, quantity: float, action: str, latency: float | None = None
+    agent_id: str,
+    product_id: str,
+    quantity: float,
+    action: str,
+    latency: float | None = None,
+    order_type: str = "market",
+    limit_price: float | None = None,
 ) -> str:
-    result = store.execute_trade(agent_id, product_id, quantity, action, latency=latency)
+    result = store.execute_trade(
+        agent_id,
+        product_id,
+        quantity,
+        action,
+        latency=latency,
+        order_type=order_type,
+        limit_price=limit_price,
+    )
+    logger.info("TRADE %s | %s %s %s qty=%.4f | success=%s | %s",
+                agent_id, action, product_id, order_type, quantity,
+                result.success, result.message[:120])
     view.rerender()
     return result.message
 
@@ -536,7 +786,12 @@ def _get_portfolio(agent_id: str) -> str:
     account = store.get_or_create(agent_id)
     pb = store.price_book
 
-    lines = [f"Cash: ${account.cash:,.2f}"]
+    lines = [
+        f"Cash: ${account.cash:,.2f}",
+        f"Realized P&L: ${account.realized_pnl:,.2f}",
+        f"Fees Paid: ${account.fees_paid:,.2f}",
+        f"Max Drawdown: {account.max_drawdown * 100:.2f}%",
+    ]
 
     if not account.positions:
         lines.append("Positions: none")
@@ -579,16 +834,26 @@ def _get_portfolio(agent_id: str) -> str:
 
 
 @agent_tool
-def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: str) -> str:
+def execute_trade(
+    ctx: ToolContext,
+    product_id: str,
+    quantity: float,
+    action: str,
+    order_type: str = "market",
+    limit_price: float | None = None,
+) -> str:
     """Execute a buy or sell trade (fill-or-cancel). The order fills immediately at the current
     market price if possible, or returns an error if it cannot be filled — it never waits or queues.
     Buys execute at the best ask price, sells at the best bid.
-    Fractional share trading is allowed, but only to one decimal place (e.g., 0.5, 1.2).
+    Fractional share trading is allowed, up to 4 decimal places (e.g., 0.5, 0.0015).
+    Your starting cash is $100. Size positions accordingly — check your portfolio first!
 
     Args:
-        product_id: Trading pair (e.g., BTC-USD, FARTCOIN-USD, SOL-USD)
-        quantity: Number of units to trade (positive, up to 1 decimal place)
+        product_id: Trading pair (e.g., DOGE-USD, PEPE-USD, SHIB-USD, BNKR-USD, WIF-USD)
+        quantity: Number of units to trade (positive, up to 4 decimal places)
         action: 'buy' or 'sell'
+        order_type: 'market' or 'limit' (default: market)
+        limit_price: Required for limit orders. If not crossable, the order is rejected.
 
     Returns:
         Trade confirmation with execution price and remaining cash, or an error message
@@ -596,7 +861,15 @@ def execute_trade(ctx: ToolContext, product_id: str, quantity: float, action: st
     latency: float | None = None
     if isinstance(ctx.deps, dict) and "invoked_at" in ctx.deps:
         latency = time.time() - ctx.deps["invoked_at"]
-    return _execute_trade(ctx.agent_name, product_id, quantity, action, latency=latency)
+    return _execute_trade(
+        ctx.agent_name,
+        product_id,
+        quantity,
+        action,
+        latency=latency,
+        order_type=order_type,
+        limit_price=limit_price,
+    )
 
 
 @agent_tool
@@ -608,6 +881,150 @@ def get_portfolio(ctx: ToolContext) -> str:
         price, unrealized P&L, and average time held — plus cash and total value
     """
     return _get_portfolio(ctx.agent_name)
+
+
+@agent_tool
+def get_trade_history(ctx: ToolContext, limit: int = 10) -> str:
+    """Review your recent trade history with outcomes. Use this to learn from
+    past decisions — see which trades were profitable and which lost money.
+
+    Args:
+        limit: Number of recent trades to return (default: 10, max: 30)
+
+    Returns:
+        A list of your recent trades with entry price, current price,
+        unrealized or realized P&L, and hold time
+    """
+    agent_id = ctx.agent_name
+    limit = min(max(1, limit), 30)
+    account = store.get_or_create(agent_id)
+    account.memory_calls += 1
+    logger.info("MEMORY %s | get_trade_history (call #%d)", agent_id, account.memory_calls)
+    if _persistence is not None:
+        _persistence.save_account(agent_id, account)
+
+    # Get this agent's trades from the log (most recent first)
+    agent_trades = [
+        (ts, aid, action, pid, qty, price, fee, lat)
+        for ts, aid, action, pid, qty, price, fee, lat in store.trade_log
+        if aid == agent_id
+    ]
+    recent = agent_trades[-limit:]
+    recent.reverse()
+
+    if not recent:
+        return "No trade history yet. This is your first session — check your portfolio and market data to start trading."
+
+    lines = [f"Your last {len(recent)} trades (newest first):"]
+    lines.append(f"{'Time':<10} {'Action':<5} {'Product':<15} {'Qty':>10} {'Price':>12} {'Fee':>8} {'P&L':>10}")
+    lines.append("-" * 75)
+
+    for ts, _, action, pid, qty, price, fee, _ in recent:
+        # Calculate P&L for this trade
+        current_entry = store.price_book.get(pid)
+        pnl_str = "—"
+        if current_entry and action == "buy":
+            current_price = float(current_entry["best_bid"])
+            pnl = (current_price - price) * qty - fee
+            pnl_str = f"${pnl:+,.2f}" if abs(pnl) >= 0.01 else "~$0"
+        elif action == "sell":
+            pnl_str = "realized"
+
+        lines.append(
+            f"{ts:<10} {action.upper():<5} {pid:<15} {qty:>10.4f} "
+            f"${price:>10.6f} ${fee:>6.4f} {pnl_str:>10}"
+        )
+
+    # Add summary stats
+    wins = account.wins
+    losses = account.losses
+    total = wins + losses
+    win_rate = (wins / total * 100) if total > 0 else 0
+    lines.append("")
+    lines.append(f"Summary: {account.trade_count} total trades | "
+                 f"Win rate: {win_rate:.0f}% ({wins}W/{losses}L) | "
+                 f"Realized P&L: ${account.realized_pnl:+,.2f} | "
+                 f"Fees paid: ${account.fees_paid:,.2f}")
+
+    return "\n".join(lines)
+
+
+@agent_tool
+def get_performance_stats(ctx: ToolContext) -> str:
+    """Get a detailed performance summary for your trading account.
+    Use this to evaluate your overall strategy effectiveness and identify
+    what's working vs what's not.
+
+    Returns:
+        Win/loss ratio, P&L breakdown by coin, best and worst trades,
+        drawdown stats, and fee impact analysis
+    """
+    agent_id = ctx.agent_name
+    account = store.get_or_create(agent_id)
+    account.memory_calls += 1
+    logger.info("MEMORY %s | get_performance_stats (call #%d)", agent_id, account.memory_calls)
+    if _persistence is not None:
+        _persistence.save_account(agent_id, account)
+
+    # Group trades by product
+    product_stats: dict[str, dict] = {}
+    agent_trades = [
+        (ts, aid, action, pid, qty, price, fee, lat)
+        for ts, aid, action, pid, qty, price, fee, lat in store.trade_log
+        if aid == agent_id
+    ]
+
+    for ts, _, action, pid, qty, price, fee, _ in agent_trades:
+        if pid not in product_stats:
+            product_stats[pid] = {"buys": 0, "sells": 0, "buy_vol": 0.0, "sell_vol": 0.0, "fees": 0.0}
+        if action == "buy":
+            product_stats[pid]["buys"] += 1
+            product_stats[pid]["buy_vol"] += qty * price
+        else:
+            product_stats[pid]["sells"] += 1
+            product_stats[pid]["sell_vol"] += qty * price
+        product_stats[pid]["fees"] += fee
+
+    total_value = account.cash
+    for pid, qty in account.positions.items():
+        entry = store.price_book.get(pid)
+        if entry:
+            total_value += qty * float(entry["best_bid"])
+
+    lines = ["=== PERFORMANCE REPORT ===", ""]
+    lines.append(f"Account Value: ${total_value:,.2f} (started at ${INITIAL_CASH:,.2f})")
+    lines.append(f"Total Return: {((total_value - INITIAL_CASH) / INITIAL_CASH * 100):+.2f}%")
+    lines.append(f"Cash: ${account.cash:,.2f}")
+    lines.append(f"Realized P&L: ${account.realized_pnl:+,.2f}")
+    lines.append(f"Total Fees: ${account.fees_paid:,.2f}")
+    lines.append(f"Max Drawdown: {account.max_drawdown * 100:.1f}%")
+    lines.append("")
+
+    wins = account.wins
+    losses = account.losses
+    total = wins + losses
+    lines.append(f"Trades: {account.trade_count} total | "
+                 f"{wins}W / {losses}L | "
+                 f"Win rate: {(wins/total*100) if total > 0 else 0:.0f}%")
+    lines.append("")
+
+    if product_stats:
+        lines.append("By product:")
+        for pid, ps in sorted(product_stats.items()):
+            held = account.positions.get(pid, 0)
+            entry = store.price_book.get(pid)
+            current_val = held * float(entry["best_bid"]) if entry and held > 0 else 0
+            lines.append(
+                f"  {pid}: {ps['buys']}B/{ps['sells']}S | "
+                f"bought ${ps['buy_vol']:,.2f} sold ${ps['sell_vol']:,.2f} | "
+                f"holding {held:,.4f} (${current_val:,.2f}) | fees ${ps['fees']:,.4f}"
+            )
+
+    lines.append("")
+    lines.append("TIP: Focus on coins where you have positive P&L. "
+                 "Cut losers early. Size winners bigger.")
+
+    return "\n".join(lines)
 
 
 @agent_tool

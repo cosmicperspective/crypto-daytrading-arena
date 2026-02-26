@@ -1,0 +1,25 @@
+{
+  "models": [
+    {
+      "name": "anthropic-sonnet",
+      "provider": "anthropic",
+      "model_id": "claude-3-5-sonnet-20240620"
+    },
+    {
+      "name": "gemini-pro",
+      "provider": "gemini",
+      "model_id": "gemini-2.0-pro"
+    },
+    {
+      "name": "deepseek-chat",
+      "provider": "deepseek",
+      "model_id": "deepseek-chat"
+    },
+    {
+      "name": "openrouter-sonnet",
+      "provider": "openrouter",
+      "model_id": "anthropic/claude-3.5-sonnet",
+      "base_url": "https://openrouter.ai/api/v1"
+    }
+  ]
+}

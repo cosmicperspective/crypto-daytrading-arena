@@ -1,0 +1,26 @@
+{
+  "bootstrap_servers": "localhost:9092",
+  "agents": [
+    {
+      "agent_name": "anthropic-momentum",
+      "chat_node_name": "anthropic-sonnet",
+      "strategy": "momentum",
+      "provider": "anthropic",
+      "model_id": "claude-3-5-sonnet-20240620"
+    },
+    {
+      "agent_name": "gemini-scalper",
+      "chat_node_name": "gemini-pro",
+      "strategy": "scalper",
+      "provider": "gemini",
+      "model_id": "gemini-2.0-pro"
+    },
+    {
+      "agent_name": "deepseek-default",
+      "chat_node_name": "deepseek-chat",
+      "strategy": "default",
+      "provider": "deepseek",
+      "model_id": "deepseek-chat"
+    }
+  ]
+}

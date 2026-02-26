@@ -1,0 +1,33 @@
+{
+  "bootstrap_servers": "localhost:9092",
+  "agents": [
+    {
+      "agent_name": "agent-default",
+      "chat_node_name": "gemini-flash",
+      "strategy": "default",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    },
+    {
+      "agent_name": "agent-momentum",
+      "chat_node_name": "gemini-flash",
+      "strategy": "momentum",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    },
+    {
+      "agent_name": "agent-brainrot",
+      "chat_node_name": "gemini-flash",
+      "strategy": "brainrot",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    },
+    {
+      "agent_name": "agent-scalper",
+      "chat_node_name": "gemini-flash",
+      "strategy": "scalper",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    }
+  ]
+}

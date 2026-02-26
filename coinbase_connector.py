@@ -42,6 +42,18 @@ def parse_args():
         default=60.0,
         help="Minimum publish interval in seconds between market data updates to agents (default: 60)",
     )
+    parser.add_argument(
+        "--min-change-bps",
+        type=float,
+        default=0.0,
+        help="Only invoke agents when price moves this many bps. 0 = always (default: 0).",
+    )
+    parser.add_argument(
+        "--max-silent-seconds",
+        type=float,
+        default=60.0,
+        help="Force publish after this many seconds of silence (default: 60).",
+    )
     return parser.parse_args()
 
 
@@ -68,6 +80,8 @@ async def main():
     print(f"  Router topic: {router_node.subscribed_topic}")
     print(f"  Products: {', '.join(DEFAULT_PRODUCTS)}")
     print(f"  Min publish interval: {args.interval}s")
+    print(f"  Price change gate: {args.min_change_bps} bps")
+    print(f"  Max silent: {args.max_silent_seconds}s")
 
     candle_book = CandleBook()
 
@@ -77,6 +91,8 @@ async def main():
         products=DEFAULT_PRODUCTS,
         min_publish_interval=args.interval,
         candle_book=candle_book,
+        min_change_bps=args.min_change_bps,
+        max_silent_seconds=args.max_silent_seconds,
     )
 
     print("\nStarting Coinbase connector...")

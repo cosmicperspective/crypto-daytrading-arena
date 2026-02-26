@@ -1,0 +1,10 @@
+{
+  "models": [
+    {
+      "name": "gemini-flash",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash",
+      "base_url": "https://openrouter.ai/api/v1"
+    }
+  ]
+}

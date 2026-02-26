@@ -7,14 +7,18 @@ from rich.live import Live
 
 from calfkit.broker.broker import BrokerClient
 from calfkit.runners.service import NodesService
+from agent_registry import AGENT_REGISTRY_TOPIC, AgentMeta
 from coinbase_kafka_connector import (
     PRICE_TOPIC,
     TickerMessage,
 )
 from trading_tools import (
+    _persistence,
     calculator,
     execute_trade,
+    get_performance_stats,
     get_portfolio,
+    get_trade_history,
     price_book,
     view,
 )
@@ -65,15 +69,38 @@ async def main():
 
     # ── Tool nodes ───────────────────────────────────────────────
     print("\nRegistering trading tool nodes...")
-    for tool in (execute_trade, get_portfolio, calculator):
+    for tool in (execute_trade, get_portfolio, get_trade_history, get_performance_stats, calculator):
         service.register_node(tool)
         print(f"  - {tool.tool_schema.name} (topic: {tool.subscribed_topic})")
 
     # ── Price subscriber ─────────────────────────────────────────
+    _price_tick_count = 0
+
     @broker.subscriber(PRICE_TOPIC, group_id="tools-dashboard")
     async def handle_price_update(ticker: TickerMessage) -> None:
+        nonlocal _price_tick_count
         price_book.update(ticker.model_dump())
+        # Persist price snapshot for dashboard history
+        if _persistence is not None:
+            import time as _time
+            try:
+                _persistence.insert_price(
+                    ts=_time.time(),
+                    product_id=ticker.product_id,
+                    price=float(ticker.price),
+                    best_bid=float(ticker.best_bid) if ticker.best_bid else None,
+                    best_ask=float(ticker.best_ask) if ticker.best_ask else None,
+                )
+            except Exception:
+                pass
+            _price_tick_count += 1
+            if _price_tick_count % 500 == 0:
+                _persistence.cleanup_old_prices()
         view.rerender()
+
+    @broker.subscriber(AGENT_REGISTRY_TOPIC, group_id="tools-dashboard")
+    async def handle_agent_meta(meta: AgentMeta) -> None:
+        view.update_agent_meta(meta)
 
     print("\nStarting portfolio dashboard (prices via Kafka)...")
 

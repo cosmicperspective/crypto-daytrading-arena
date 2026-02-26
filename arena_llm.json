@@ -1,0 +1,40 @@
+{
+  "bootstrap_servers": "localhost:9092",
+  "agents": [
+    {
+      "agent_name": "agent-gemini",
+      "chat_node_name": "gemini-flash",
+      "strategy": "neutral",
+      "provider": "openrouter",
+      "model_id": "google/gemini-2.5-flash"
+    },
+    {
+      "agent_name": "agent-gpt5nano",
+      "chat_node_name": "gpt5-nano",
+      "strategy": "neutral",
+      "provider": "openrouter",
+      "model_id": "openai/gpt-5-nano"
+    },
+    {
+      "agent_name": "agent-minimax",
+      "chat_node_name": "minimax-m25",
+      "strategy": "neutral",
+      "provider": "openrouter",
+      "model_id": "minimax/minimax-m2.5"
+    },
+    {
+      "agent_name": "agent-grok",
+      "chat_node_name": "grok-fast",
+      "strategy": "neutral",
+      "provider": "openrouter",
+      "model_id": "x-ai/grok-4.1-fast"
+    },
+    {
+      "agent_name": "agent-haiku",
+      "chat_node_name": "haiku",
+      "strategy": "neutral",
+      "provider": "openrouter",
+      "model_id": "anthropic/claude-haiku-4.5"
+    }
+  ]
+}

@@ -1,22 +1,23 @@
-"""Deploy a single named ChatNode backed by an OpenAI-compatible model.
+"""Deploy a single named ChatNode backed by a selected model provider.
 
 Run one instance per model. The node listens on its private topic
 ``ai_prompted.<name>`` so that agent routers can target it by name.
 
 Example:
     uv run python deploy_chat_node.py \
-        --name gpt5-nano --model-id gpt-5-nano --bootstrap-servers <broker-url> \
+        --name gpt5-nano --provider openai --model-id gpt-5-nano --bootstrap-servers <broker-url> \
         --reasoning-effort low
 
     uv run python deploy_chat_node.py \
-        --name deepseek --model-id deepseek-chat --bootstrap-servers <broker-url> \
-        --base-url https://api.deepseek.com/v1 --api-key $DEEPSEEK_API_KEY
+        --name deepseek --provider deepseek --model-id deepseek-chat --bootstrap-servers <broker-url> \
+        --base-url <deepseek-base-url> --api-key $DEEPSEEK_API_KEY
 """
 
 import argparse
 import asyncio
 import os
 import sys
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -36,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         "--name",
         required=True,
         help="ChatNode name (becomes private topic ai_prompted.<name>)",
+    )
+    parser.add_argument(
+        "--provider",
+        default="openai",
+        choices=["openai", "anthropic", "gemini", "deepseek", "openai-compatible", "openrouter"],
+        help="Model provider (default: openai).",
     )
     parser.add_argument(
         "--model-id",
@@ -71,14 +78,61 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_api_key(provider: str, explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    env_map = {
+        "openai": "OPENAI_API_KEY",
+        "openai-compatible": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }
+    return os.getenv(env_map.get(provider, "OPENAI_API_KEY"))
+
+
+def _build_model_client(
+    provider: str,
+    model_id: str,
+    base_url: str | None,
+    api_key: str,
+    reasoning_effort: str | None,
+) -> Any:
+    if provider in {"openai", "openai-compatible", "deepseek", "gemini", "openrouter"}:
+        if provider == "openrouter" and not base_url:
+            base_url = os.getenv("OPENROUTER_BASE_URL")
+        return OpenAIModelClient(
+            model_name=model_id,
+            base_url=base_url,
+            api_key=api_key,
+            reasoning_effort=reasoning_effort,
+        )
+
+    if provider == "anthropic":
+        try:
+            from calfkit.providers.pydantic_ai.anthropic import AnthropicModelClient  # type: ignore
+        except Exception:
+            print("ERROR: Anthropic provider not available in calfkit.")
+            print("Install a calfkit version that includes AnthropicModelClient.")
+            sys.exit(1)
+        return AnthropicModelClient(
+            model_name=model_id,
+            api_key=api_key,
+        )
+
+    print(f"ERROR: Unsupported provider '{provider}'.")
+    sys.exit(1)
+
+
 async def main() -> None:
     args = parse_args()
 
     # Resolve API key: explicit flag > env var
-    api_key = args.api_key or os.getenv("OPENAI_API_KEY")
+    api_key = _resolve_api_key(args.provider, args.api_key)
     if not api_key:
         print("ERROR: No API key provided.")
-        print("Pass --api-key or set OPENAI_API_KEY.")
+        print("Pass --api-key or set a provider-specific key (e.g. OPENAI_API_KEY).")
         sys.exit(1)
 
     print("=" * 50)
@@ -89,8 +143,9 @@ async def main() -> None:
     broker = BrokerClient(bootstrap_servers=args.bootstrap_servers)
 
     print(f"Configuring model client: {args.model_id}")
-    model_client = OpenAIModelClient(
-        model_name=args.model_id,
+    model_client = _build_model_client(
+        provider=args.provider,
+        model_id=args.model_id,
         base_url=args.base_url,
         api_key=api_key,
         reasoning_effort=args.reasoning_effort,
@@ -101,6 +156,7 @@ async def main() -> None:
     service.register_node(chat_node, max_workers=args.max_workers)
 
     print(f"  - Name:  {args.name}")
+    print(f"  - Provider: {args.provider}")
     print(f"  - Model: {args.model_id}")
     print(f"  - Topic: {chat_node.entrypoint_topic}")
     print(f"  - Workers: {args.max_workers}")

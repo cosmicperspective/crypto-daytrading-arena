@@ -147,13 +147,27 @@ Note: ChatNodes are stateless so multiple agents can share the same ChatNode.
 ```bash
 # OpenAI model
 uv run python deploy_chat_node.py \
-    --name <unique-name-of-chatnode> --model-id <openai-model-id> --bootstrap-servers <broker-url> \
+    --name <unique-name-of-chatnode> --provider openai \
+    --model-id <openai-model-id> --bootstrap-servers <broker-url> \
     --reasoning-effort <optional-reasoning-level> --api-key <api-key>
 
 # Or, OpenAI-compatible provider (e.g. DeepInfra, Gemini, etc.)
 uv run python deploy_chat_node.py \
-    --name <unique-name-of-chatnode> --model-id <model-id> --bootstrap-servers <broker-url> \
+    --name <unique-name-of-chatnode> --provider openai-compatible \
+    --model-id <model-id> --bootstrap-servers <broker-url> \
     --base-url <llm-provider-base-url> --reasoning-effort <optional-reasoning-level> --api-key <api-key>
+
+# Or, OpenRouter (OpenAI-compatible)
+uv run python deploy_chat_node.py \
+    --name <unique-name-of-chatnode> --provider openrouter \
+    --model-id <openrouter-model-id> --bootstrap-servers <broker-url> \
+    --base-url <openrouter-base-url> --api-key <openrouter-api-key>
+
+# Or, Anthropic model (requires calfkit Anthropic provider)
+uv run python deploy_chat_node.py \
+    --name <unique-name-of-chatnode> --provider anthropic \
+    --model-id <anthropic-model-id> --bootstrap-servers <broker-url> \
+    --api-key <anthropic-api-key>
 
 # Or, source .venv/bin/activate && python deploy_chat_node.py \
 #     --name <unique-name-of-chatnode> --model-id <model-id> --bootstrap-servers <broker-url> \
@@ -169,7 +183,8 @@ Deploy one router per agent. Each targets a ChatNode you define by name and uses
 ```bash
 uv run python deploy_router_node.py \
     --name <unique-agent-name> --chat-node-name <name-of-chatnode> \
-    --strategy <strategy> --bootstrap-servers <broker-url>
+    --strategy <strategy> --bootstrap-servers <broker-url> \
+    --provider <provider> --model-id <model-id>
 
 # Or, source .venv/bin/activate && python deploy_router_node.py \
 #     --name <unique-agent-name> --chat-node-name <name-of-chatnode> \
@@ -213,3 +228,26 @@ For full CLI flags and options, see [CLI_REFERENCE.md](CLI_REFERENCE.md).
 |------|----------|---------|-------------|
 | `trading_tools.py` | `INITIAL_CASH` | `100_000.0` | Starting cash balance per agent |
 | `coinbase_kafka_connector.py` | `DEFAULT_PRODUCTS` | 3 products | Products tracked by the price feed |
+
+## Simulation Realism
+
+Set `SIM_PRESET` in `.env` to adjust realism:
+`paper` (default), `realistic`, or `ultra`.
+You can override any parameter with `SIM_` env vars (see `.env.example`).
+Funding/borrow rates are currently placeholders (configured but not applied).
+
+## Persistence
+
+By default, portfolios and trade logs persist to SQLite at `SIM_DB_PATH`
+(default: `arena.db`). Disable by setting `SIM_DB_PATH=` in your environment.
+
+## Multi-Model Testing + Leaderboard
+
+1. Edit `models.json` and `arena_tests.json` to define ChatNodes and agents.
+2. Launch processes:
+
+```bash
+uv run python run_arena.py --start tools connector chatnodes routers
+```
+
+The dashboard includes a **Leaderboard** panel with model/strategy metadata.

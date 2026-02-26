@@ -24,7 +24,20 @@ from calfkit.nodes.agent_router_node import AgentRouterNode
 from calfkit.nodes.chat_node import ChatNode
 from calfkit.runners.service import NodesService
 from calfkit.stores.in_memory import InMemoryMessageHistoryStore
-from trading_tools import calculator, execute_trade, get_portfolio
+from trading_tools import calculator, execute_trade, get_portfolio, get_trade_history, get_performance_stats
+from agent_registry import AGENT_REGISTRY_TOPIC, AgentMeta
+
+_MEMORY_ADDENDUM = (
+    "\n\nIMPORTANT — ALWAYS call get_trade_history before making any trade decision. "
+    "This is your memory — it shows your recent trades and whether they made or lost money. "
+    "You MUST learn from this:\n"
+    "- If a coin has lost you money on your last 2+ trades, STOP trading it.\n"
+    "- If a coin has been profitable, consider sizing up.\n"
+    "- If your overall win rate is below 50%, be MORE selective — skip marginal setups.\n"
+    "- If fees are eating your profits, make fewer but larger trades.\n"
+    "You also have get_performance_stats for a full performance breakdown by coin.\n"
+    "Your workflow each tick: get_trade_history → get_portfolio → analyze market → decide."
+)
 
 _REASONING_ADDENDUM = (
     "\n\nAt the end of your response, include a brief 'Reasoning:' section that concisely "
@@ -44,6 +57,7 @@ STRATEGIES: dict[str, str] = {
         "Consider price trends, momentum, support/resistance levels, and risk management "
         "when deciding whether to trade or hold. Explain your reasoning briefly."
     )
+    + _MEMORY_ADDENDUM
     + _REASONING_ADDENDUM,
     "momentum": (
         "You are a momentum day trader operating in crypto markets. Your trading philosophy "
@@ -63,6 +77,7 @@ STRATEGIES: dict[str, str] = {
         "available products and act decisively when you spot a strong trend. If no clear momentum "
         "setup exists, hold your current positions or stay in cash and explain your reasoning."
     )
+    + _MEMORY_ADDENDUM
     + _REASONING_ADDENDUM,
     "brainrot": (
         "You are the ultimate brainrot daytrader. You channel pure wallstreetbets energy. "
@@ -79,6 +94,7 @@ STRATEGIES: dict[str, str] = {
         "invocation. You should almost always be making a trade. Cash sitting idle is cash not "
         "making gains. Send it."
     )
+    + _MEMORY_ADDENDUM
     + _REASONING_ADDENDUM,
     "scalper": (
         "You are a scalper day trader operating in crypto markets. Your trading philosophy is "
@@ -100,6 +116,22 @@ STRATEGIES: dict[str, str] = {
         "movements to exploit and execute trades frequently. Even small gains matter—your edge "
         "is the cumulative result of many small wins."
     )
+    + _MEMORY_ADDENDUM
+    + _REASONING_ADDENDUM,
+    "neutral": (
+        "You are a crypto day trader competing against other AI models. Your goal is to "
+        "maximize your total account balance (cash + portfolio value) over time.\n\n"
+        "You will be invoked periodically with live market data including current "
+        "prices, bid/ask spreads, and multi-timeframe candlestick charts (1-min, "
+        "5-min, and 15-min) for several cryptocurrency products.\n\n"
+        "You have access to tools to view your portfolio, execute trades (buy/sell at "
+        "market price), and a calculator for math.\n\n"
+        "There are no constraints on your trading style — you may trade frequently or "
+        "infrequently, concentrate or diversify, follow trends or be contrarian. "
+        "Use whatever approach you believe will maximize returns. The only metric "
+        "that matters is your total portfolio value."
+    )
+    + _MEMORY_ADDENDUM
     + _REASONING_ADDENDUM,
 }
 
@@ -117,6 +149,16 @@ def parse_args() -> argparse.Namespace:
         "--chat-node-name",
         required=True,
         help="Name of the deployed ChatNode to target (e.g. gpt5-nano)",
+    )
+    parser.add_argument(
+        "--provider",
+        default="unknown",
+        help="Model provider for metadata (e.g. openai, anthropic, gemini, deepseek).",
+    )
+    parser.add_argument(
+        "--model-id",
+        default="unknown",
+        help="Model ID for metadata (e.g. gpt-5-nano, claude-3-5-sonnet).",
     )
     parser.add_argument(
         "--strategy",
@@ -152,7 +194,7 @@ async def main() -> None:
     # ChatNode reference for topic routing (deployed separately via deploy_chat_node.py)
     chat_node = ChatNode(name=args.chat_node_name)
 
-    tools = [execute_trade, get_portfolio, calculator]
+    tools = [execute_trade, get_portfolio, get_trade_history, get_performance_stats, calculator]
     router = AgentRouterNode(
         chat_node=chat_node,
         tool_nodes=tools,
@@ -166,9 +208,22 @@ async def main() -> None:
     print(f"  - Agent:    {args.name}")
     print(f"  - Strategy: {args.strategy}")
     print(f"  - ChatNode: {args.chat_node_name} (topic: {chat_node.entrypoint_topic})")
+    print(f"  - Provider: {args.provider}")
+    print(f"  - Model:    {args.model_id}")
     print(f"  - Input:    {router.subscribed_topic}")
     print(f"  - Reply:    {router.entrypoint_topic}")
     print(f"  - Tools:    {tool_names}")
+
+    meta = AgentMeta.create(
+        agent_name=args.name,
+        chat_node_name=args.chat_node_name,
+        model_id=args.model_id,
+        provider=args.provider,
+        strategy=args.strategy,
+    )
+
+    await broker.connect()
+    await broker.publish(meta.model_dump(), AGENT_REGISTRY_TOPIC)
 
     print("\nRouter node ready. Waiting for requests...")
     await service.run()

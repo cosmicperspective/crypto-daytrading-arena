@@ -40,9 +40,11 @@ logger = logging.getLogger(__name__)
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
 DEFAULT_PRODUCTS = [
-    "BTC-USD",
-    "FARTCOIN-USD",
-    "SOL-USD",
+    "DOGE-USD",
+    "PEPE-USD",
+    "SHIB-USD",
+    "BNKR-USD",
+    "WIF-USD",
 ]
 
 RECONNECT_DELAY_SECONDS = 3
@@ -91,6 +93,8 @@ class CoinbaseKafkaConnector:
         products: list[str],
         min_publish_interval: float = 0.0,
         candle_book: CandleBook | None = None,
+        min_change_bps: float = 0.0,
+        max_silent_seconds: float = 60.0,
     ) -> None:
         self._broker = broker
         self._client = RouterServiceClient(broker, router_node)
@@ -98,9 +102,14 @@ class CoinbaseKafkaConnector:
         self._min_interval = min_publish_interval
         self._running = True
         self._candle_book = candle_book
+        self._min_change_bps = min_change_bps
+        self._max_silent_seconds = max_silent_seconds
 
         # Latest ticker per product — patched on every incoming message
         self._latest: dict[str, TickerMessage] = {}
+        # Last published prices for change-gate comparison
+        self._last_published_prices: dict[str, float] = {}
+        self._last_publish_time: float = 0.0
 
     async def start(self) -> None:
         """Start the connector. Blocks until shutdown is triggered."""
@@ -135,9 +144,36 @@ class CoinbaseKafkaConnector:
         """Signal the connector to shut down gracefully."""
         self._running = False
 
+    def _prices_changed_enough(self) -> bool:
+        """Check if any product price moved more than min_change_bps since last publish."""
+        if self._min_change_bps <= 0.0:
+            return True
+        if not self._last_published_prices:
+            return True  # First publish always goes through
+        # Force publish if we've been silent too long
+        if self._last_publish_time > 0 and (
+            time.time() - self._last_publish_time > self._max_silent_seconds
+        ):
+            return True
+        for pid, ticker in self._latest.items():
+            try:
+                current = float(ticker.price)
+            except (ValueError, TypeError):
+                continue
+            prev = self._last_published_prices.get(pid)
+            if prev is None or prev == 0:
+                return True
+            change_bps = abs(current - prev) / prev * 10_000
+            if change_bps >= self._min_change_bps:
+                return True
+        return False
+
     async def _publish_latest(self) -> None:
         """Snapshot and publish the current latest tickers as a single batch."""
         if not self._latest:
+            return
+
+        if not self._prices_changed_enough():
             return
 
         batch = list(self._latest.values())
@@ -177,6 +213,14 @@ class CoinbaseKafkaConnector:
             user_prompt="\n".join(prompt_parts),
             deps={"invoked_at": time.time()},
         )
+
+        # Record published prices for change-gate comparison
+        for t in batch:
+            try:
+                self._last_published_prices[t.product_id] = float(t.price)
+            except (ValueError, TypeError):
+                pass
+        self._last_publish_time = time.time()
 
         summary = ", ".join(f"{t.product_id} @ ${t.price}" for t in batch)
         logger.info(
@@ -281,6 +325,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--min-change-bps",
+        type=float,
+        default=0.0,
+        help=(
+            "Only invoke agents when at least one product price has changed "
+            "by this many basis points since last publish. 0 = always publish (default: 0). "
+            "Recommended: 10-30 bps (0.1%%-0.3%%)."
+        ),
+    )
+    parser.add_argument(
+        "--max-silent-seconds",
+        type=float,
+        default=60.0,
+        help=(
+            "Force a publish if no price-triggered publish has happened for this many seconds. "
+            "Ensures agents stay alive even in flat markets (default: 60)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -296,6 +359,8 @@ async def run(args: argparse.Namespace, router_node: AgentRouterNode) -> None:
         router_node=router_node,
         products=args.products,
         min_publish_interval=args.min_interval,
+        min_change_bps=args.min_change_bps,
+        max_silent_seconds=args.max_silent_seconds,
     )
 
     loop = asyncio.get_running_loop()
@@ -307,6 +372,8 @@ async def run(args: argparse.Namespace, router_node: AgentRouterNode) -> None:
     logger.info("  Broker:        %s", args.bootstrap_servers)
     logger.info("  Products:      %s", ", ".join(args.products))
     logger.info("  Min interval:  %ss", args.min_interval)
+    logger.info("  Change gate:   %s bps", args.min_change_bps)
+    logger.info("  Max silent:    %ss", args.max_silent_seconds)
 
     await connector.start()
 

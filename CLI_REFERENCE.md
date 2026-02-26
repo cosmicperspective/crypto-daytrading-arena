@@ -5,6 +5,7 @@
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--name` | Yes | — | ChatNode name (becomes topic `ai_prompted.<name>`) |
+| `--provider` | No | `openai` | Model provider (`openai`, `anthropic`, `gemini`, `deepseek`, `openai-compatible`, `openrouter`) |
 | `--model-id` | Yes | — | Model ID (e.g. `gpt-5-nano`, `deepseek-chat`) |
 | `--bootstrap-servers` | Yes | — | Kafka broker address |
 | `--base-url` | No | OpenAI | Base URL for OpenAI-compatible providers |
@@ -18,5 +19,7 @@
 |------|----------|---------|-------------|
 | `--name` | Yes | — | Agent name (consumer group + identity) |
 | `--chat-node-name` | Yes | — | Name of the deployed ChatNode to target |
+| `--provider` | No | `unknown` | Model provider (metadata for leaderboard) |
+| `--model-id` | No | `unknown` | Model ID (metadata for leaderboard) |
 | `--strategy` | Yes | — | Trading strategy: `default`, `momentum`, `brainrot`, or `scalper` |
 | `--bootstrap-servers` | Yes | — | Kafka broker address |
