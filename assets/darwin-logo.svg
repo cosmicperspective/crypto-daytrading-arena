@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 220">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0a0a0a"/>
+      <stop offset="100%" style="stop-color:#1a1a2e"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#f59e0b"/>
+      <stop offset="50%" style="stop-color:#fbbf24"/>
+      <stop offset="100%" style="stop-color:#f59e0b"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#34d399"/>
+      <stop offset="100%" style="stop-color:#10b981"/>
+    </linearGradient>
+    <linearGradient id="red" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f87171"/>
+      <stop offset="100%" style="stop-color:#ef4444"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="220" rx="16" fill="url(#bg)"/>
+  <rect width="800" height="220" rx="16" fill="none" stroke="#333" stroke-width="1"/>
+
+  <!-- DNA Helix (left side) -->
+  <g transform="translate(60, 110)" opacity="0.9">
+    <!-- Strand 1 -->
+    <path d="M-20,-70 Q10,-55 -5,-40 Q-20,-25 10,-10 Q40,5 -5,20 Q-20,35 10,50 Q40,65 -5,70"
+          fill="none" stroke="url(#green)" stroke-width="3" stroke-linecap="round"/>
+    <!-- Strand 2 -->
+    <path d="M20,-70 Q-10,-55 5,-40 Q20,-25 -10,-10 Q-40,5 5,20 Q20,35 -10,50 Q-40,65 5,70"
+          fill="none" stroke="url(#gold)" stroke-width="3" stroke-linecap="round"/>
+    <!-- Rungs -->
+    <line x1="-12" y1="-55" x2="12" y2="-55" stroke="#555" stroke-width="1.5"/>
+    <line x1="-8" y1="-40" x2="8" y2="-40" stroke="#555" stroke-width="1.5"/>
+    <line x1="-15" y1="-25" x2="15" y2="-25" stroke="#555" stroke-width="1.5"/>
+    <line x1="-12" y1="-10" x2="12" y2="-10" stroke="#555" stroke-width="1.5"/>
+    <line x1="-8" y1="5" x2="8" y2="5" stroke="#555" stroke-width="1.5"/>
+    <line x1="-15" y1="20" x2="15" y2="20" stroke="#555" stroke-width="1.5"/>
+    <line x1="-12" y1="35" x2="12" y2="35" stroke="#555" stroke-width="1.5"/>
+    <line x1="-8" y1="50" x2="8" y2="50" stroke="#555" stroke-width="1.5"/>
+  </g>
+
+  <!-- Candlestick chart (right side) -->
+  <g transform="translate(680, 60)">
+    <!-- Candles -->
+    <line x1="-60" y1="20" x2="-60" y2="80" stroke="#555" stroke-width="1"/>
+    <rect x="-64" y="35" width="8" height="25" fill="url(#red)" rx="1"/>
+
+    <line x1="-40" y1="30" x2="-40" y2="90" stroke="#555" stroke-width="1"/>
+    <rect x="-44" y="40" width="8" height="35" fill="url(#red)" rx="1"/>
+
+    <line x1="-20" y1="25" x2="-20" y2="85" stroke="#555" stroke-width="1"/>
+    <rect x="-24" y="30" width="8" height="30" fill="url(#green)" rx="1"/>
+
+    <line x1="0" y1="10" x2="0" y2="70" stroke="#555" stroke-width="1"/>
+    <rect x="-4" y="15" width="8" height="35" fill="url(#green)" rx="1"/>
+
+    <line x1="20" y1="5" x2="20" y2="60" stroke="#555" stroke-width="1"/>
+    <rect x="16" y="8" width="8" height="30" fill="url(#green)" rx="1"/>
+
+    <line x1="40" y1="0" x2="40" y2="50" stroke="#555" stroke-width="1"/>
+    <rect x="36" y="3" width="8" height="25" fill="url(#green)" rx="1"/>
+  </g>
+
+  <!-- Main title -->
+  <text x="400" y="95" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-weight="800" font-size="72" fill="url(#gold)" letter-spacing="6">
+    DARWIN
+  </text>
+
+  <!-- Subtitle -->
+  <text x="400" y="135" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-weight="400" font-size="18" fill="#9ca3af" letter-spacing="8">
+    SURVIVAL OF THE SMARTEST
+  </text>
+
+  <!-- Tagline -->
+  <text x="400" y="175" text-anchor="middle" font-family="'Segoe UI', Arial, sans-serif" font-weight="300" font-size="13" fill="#6b7280" letter-spacing="2">
+    AI AGENTS COMPETE  &#x2022;  LIVE CRYPTO  &#x2022;  NATURAL SELECTION
+  </text>
+</svg>
