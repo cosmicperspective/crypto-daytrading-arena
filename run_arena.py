@@ -162,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Force publish after this many seconds of silence (default: 30).",
     )
+    parser.add_argument(
+        "--exchange",
+        choices=["coinbase", "kraken"],
+        default="coinbase",
+        help="Exchange data source (default: coinbase).",
+    )
     parser.add_argument("--use-uv", action="store_true", help="Use uv run python")
     parser.add_argument("--dry-run", action="store_true", help="Print commands and exit")
     parser.add_argument("--log-dir", default="logs", help="Directory for process logs")
@@ -195,10 +201,11 @@ def main() -> None:
         start = {"tools", "connector", "chatnodes", "routers", "dashboard"}
 
     print("=" * 55)
-    print("  Crypto Daytrading Arena Launcher")
+    print("  Darwin Arena Launcher")
     print("=" * 55)
     if args.mode:
         print(f"  Mode:       {args.mode}")
+    print(f"  Exchange:   {args.exchange}")
     print(f"  Models:     {models_file} ({len(models)} model(s))")
     print(f"  Agents:     {tests_file} ({len(agents)} agent(s))")
     print(f"  Bootstrap:  {bootstrap}")
@@ -227,17 +234,23 @@ def main() -> None:
         if p:
             procs.append(p)
 
-    # 2. Coinbase Connector
+    # 2. Exchange Connector
     if "connector" in start:
+        if args.exchange == "kraken":
+            connector_script = "kraken_connector.py"
+            connector_name = "kraken_connector"
+        else:
+            connector_script = "coinbase_connector.py"
+            connector_name = "coinbase_connector"
         cmd = cmd_py + [
-            "coinbase_connector.py",
+            connector_script,
             "--bootstrap-servers", bootstrap,
             "--interval", str(args.connector_interval),
             "--min-change-bps", str(args.min_change_bps),
             "--max-silent-seconds", str(args.max_silent_seconds),
         ]
-        print(f"  [connector] coinbase_connector.py (interval={args.connector_interval}s, gate={args.min_change_bps}bps)")
-        p = _spawn(cmd, "coinbase_connector", args.log_dir, args.dry_run)
+        print(f"  [connector] {connector_script} (interval={args.connector_interval}s, gate={args.min_change_bps}bps)")
+        p = _spawn(cmd, connector_name, args.log_dir, args.dry_run)
         if p:
             procs.append(p)
 
